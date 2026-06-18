@@ -1,0 +1,6 @@
+1. PPT is the source of truth.
+2. PPT should be processed once.
+3. Gemini should generate narration and quizzes once.
+4. Generated narration and quizzes should be stored in MongoDB.
+5. Future sessions must reuse stored content.
+6. Do not call Gemini every time a meeting starts.

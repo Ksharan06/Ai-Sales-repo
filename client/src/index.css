@@ -1,0 +1,779 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap');
+
+:root {
+  --font-heading: 'Outfit', 'Inter', sans-serif;
+  --font-body: 'Inter', sans-serif;
+  
+  /* HSL Color Palette - Premium Slate & Blue Accent */
+  --bg-main: hsl(222, 47%, 6%);
+  --bg-panel: hsl(223, 47%, 10%);
+  --bg-glass: rgba(13, 20, 38, 0.45);
+  --border-glass: rgba(255, 255, 255, 0.08);
+  
+  --color-text-primary: hsl(210, 40%, 98%);
+  --color-text-secondary: hsl(215, 20%, 75%);
+  --color-text-muted: hsl(217, 10%, 55%);
+  
+  --accent-primary: hsl(217, 91%, 60%);
+  --accent-success: hsl(142, 72%, 45%);
+  --accent-error: hsl(346, 84%, 55%);
+  --accent-warning: hsl(48, 96%, 53%);
+  
+  --transition-smooth: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.1) transparent;
+}
+
+/* Custom Scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.3);
+}
+
+body {
+  font-family: var(--font-body);
+  background-color: var(--bg-main);
+  color: var(--color-text-primary);
+  min-height: 100vh;
+  overflow-x: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  font-family: var(--font-heading);
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+/* Glassmorphism Styles */
+.glass-panel {
+  background: var(--bg-glass);
+  backdrop-filter: blur(16px);
+  border: 1px solid var(--border-glass);
+  border-radius: 16px;
+  box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
+}
+
+.glass-card {
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  border-radius: 12px;
+  transition: var(--transition-smooth);
+}
+
+.glass-card:hover {
+  background: rgba(255, 255, 255, 0.04);
+  border-color: rgba(255, 255, 255, 0.1);
+  transform: translateY(-2px);
+}
+
+/* Zoom Classroom Grid Layout */
+.zoom-container {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  width: 100vw;
+  background-color: #000;
+  overflow: hidden;
+}
+
+.zoom-content {
+  display: flex;
+  flex: 1;
+  width: 100%;
+  height: calc(100vh - 80px); /* Subtracted bottom bar */
+  overflow: hidden;
+}
+
+.zoom-main-area {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  padding: 16px;
+  position: relative;
+  height: 100%;
+  justify-content: center;
+  align-items: center;
+}
+
+.zoom-sidebar {
+  width: 380px;
+  background-color: hsl(223, 47%, 5%);
+  border-left: 1px solid rgba(255, 255, 255, 0.06);
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  transition: var(--transition-smooth);
+}
+
+/* Zoom Video Feeds */
+.zoom-video-grid {
+  display: flex;
+  gap: 12px;
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  z-index: 10;
+}
+
+.zoom-video-card {
+  width: 200px;
+  height: 120px;
+  border-radius: 8px;
+  overflow: hidden;
+  background-color: #111;
+  border: 2px solid rgba(255, 255, 255, 0.1);
+  position: relative;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+  transition: var(--transition-smooth);
+}
+
+.zoom-video-card.active-speaker {
+  border-color: var(--accent-success);
+  box-shadow: 0 0 12px rgba(34, 197, 94, 0.4);
+}
+
+.zoom-video-card video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.zoom-video-placeholder {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: var(--color-text-secondary);
+}
+
+.zoom-video-avatar {
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, var(--accent-primary), hsl(217, 91%, 40%));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 600;
+  font-size: 1.1rem;
+  box-shadow: 0 0 10px rgba(59, 130, 246, 0.3);
+}
+
+.zoom-video-label {
+  position: absolute;
+  bottom: 6px;
+  left: 6px;
+  background: rgba(0, 0, 0, 0.65);
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 0.65rem;
+  font-weight: 500;
+  backdrop-filter: blur(4px);
+  color: #fff;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+/* Audio Wave Animation for AI Teacher */
+.speaker-wave-container {
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+  height: 18px;
+  margin-top: 4px;
+}
+
+.speaker-wave-bar {
+  width: 3px;
+  background-color: var(--accent-success);
+  border-radius: 1px;
+  height: 3px;
+}
+
+.speaker-wave-container.speaking .speaker-wave-bar {
+  animation: bounceSpeakerWave 0.8s ease-in-out infinite alternate;
+}
+
+.speaker-wave-container.speaking .speaker-wave-bar:nth-child(2) {
+  animation-delay: 0.15s;
+  animation-duration: 0.6s;
+}
+
+.speaker-wave-container.speaking .speaker-wave-bar:nth-child(3) {
+  animation-delay: 0.3s;
+  animation-duration: 0.9s;
+}
+
+.speaker-wave-container.speaking .speaker-wave-bar:nth-child(4) {
+  animation-delay: 0.45s;
+  animation-duration: 0.7s;
+}
+
+@keyframes bounceSpeakerWave {
+  0% { height: 3px; }
+  100% { height: 18px; }
+}
+
+/* Zoom Bottom Control Bar */
+.zoom-controls-bar {
+  height: 80px;
+  background-color: hsl(223, 47%, 4%);
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 24px;
+  z-index: 20;
+}
+
+.zoom-controls-group {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.zoom-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  background: transparent;
+  border: none;
+  color: var(--color-text-secondary);
+  font-size: 0.7rem;
+  font-weight: 500;
+  cursor: pointer;
+  padding: 8px 12px;
+  border-radius: 8px;
+  transition: var(--transition-smooth);
+}
+
+.zoom-btn:hover {
+  background-color: rgba(255, 255, 255, 0.05);
+  color: #fff;
+}
+
+.zoom-btn-icon {
+  width: 22px;
+  height: 22px;
+}
+
+.zoom-btn.active {
+  color: var(--accent-primary);
+}
+
+.zoom-btn.danger {
+  color: var(--accent-error);
+}
+
+.zoom-btn.danger:hover {
+  background-color: rgba(239, 68, 68, 0.1);
+}
+
+.zoom-leave-btn {
+  background-color: var(--accent-error);
+  color: #fff;
+  border: none;
+  font-weight: 600;
+  font-size: 0.85rem;
+  padding: 8px 18px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: var(--transition-smooth);
+}
+
+.zoom-leave-btn:hover {
+  background-color: hsl(346, 84%, 45%);
+  box-shadow: 0 0 10px rgba(239, 68, 68, 0.3);
+  transform: translateY(-1px);
+}
+
+/* Animations */
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes slideIn {
+  from { transform: translateY(12px); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
+}
+
+@keyframes zoomPollFadeIn {
+  from { transform: translate(-50%, -50%) scale(0.95); opacity: 0; }
+  to { transform: translate(-50%, -50%) scale(1); opacity: 1; }
+}
+
+.animate-fade {
+  animation: fadeIn 0.4s ease-out forwards;
+}
+
+.animate-slide {
+  animation: slideIn 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+/* ============================================================
+   Meeting Realism Enhancements (visual only — no layout change)
+   Target feel: ~70% Zoom / 20% Teams / 10% custom. Subtle.
+   ============================================================ */
+
+/* --- Screen share: subtle breathing presenter glow --- */
+@keyframes presenterGlow {
+  0%, 100% {
+    box-shadow: 0 22px 55px rgba(0, 0, 0, 0.72),
+                0 0 0 1px rgba(59, 130, 246, 0.16),
+                0 0 16px rgba(59, 130, 246, 0.06);
+  }
+  50% {
+    box-shadow: 0 22px 55px rgba(0, 0, 0, 0.72),
+                0 0 0 1px rgba(59, 130, 246, 0.30),
+                0 0 26px rgba(59, 130, 246, 0.13);
+  }
+}
+.screen-share-frame {
+  animation: presenterGlow 4.5s ease-in-out infinite;
+}
+
+/* Realistic presentation viewport: soft inner vignette over the slide */
+.presentation-vignette {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  box-shadow: inset 0 0 70px rgba(0, 0, 0, 0.45),
+              inset 0 0 1px rgba(255, 255, 255, 0.06);
+  z-index: 2;
+}
+
+/* Slide transition fade (replays on slide change via React key) */
+@keyframes slideSwap {
+  from { opacity: 0; transform: scale(1.012); }
+  to   { opacity: 1; transform: scale(1); }
+}
+.slide-swap {
+  animation: slideSwap 0.45s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* --- Live / recording indicators --- */
+@keyframes recBlink {
+  0%, 49%  { opacity: 1; }
+  50%, 99% { opacity: 0.25; }
+}
+.rec-dot { animation: recBlink 1.4s steps(1, end) infinite; }
+
+@keyframes livePulse {
+  0%   { box-shadow: 0 0 0 0 rgba(255, 255, 255, 0.45); }
+  70%  { box-shadow: 0 0 0 5px rgba(255, 255, 255, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(255, 255, 255, 0); }
+}
+.live-dot { animation: livePulse 2s ease-out infinite; }
+
+/* --- Network signal bars --- */
+.net-bars {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 12px;
+}
+.net-bars span {
+  width: 3px;
+  border-radius: 1px;
+  background: var(--accent-success);
+}
+.net-bars span:nth-child(1) { height: 4px; }
+.net-bars span:nth-child(2) { height: 7px; }
+.net-bars span:nth-child(3) { height: 10px; }
+.net-bars span:nth-child(4) { height: 12px; opacity: 0.28; }
+
+/* --- AI instructor: audio-reactive rings + speaking glow --- */
+@keyframes speakRing {
+  0%   { transform: scale(1);    opacity: 0.5; }
+  70%  { transform: scale(1.38); opacity: 0; }
+  100% { transform: scale(1.38); opacity: 0; }
+}
+.avatar-ring {
+  position: absolute;
+  inset: -6px;
+  border-radius: 50%;
+  border: 2px solid rgba(59, 130, 246, 0.55);
+  animation: speakRing 1.7s ease-out infinite;
+  pointer-events: none;
+}
+.avatar-ring.delay { animation-delay: 0.85s; }
+
+@keyframes cardSpeakGlow {
+  0%, 100% { box-shadow: 0 0 16px rgba(59, 130, 246, 0.16); }
+  50%      { box-shadow: 0 0 30px rgba(59, 130, 246, 0.30); }
+}
+.card-speaking { animation: cardSpeakGlow 2.4s ease-in-out infinite; }
+
+/* Soft microphone activity dot */
+@keyframes micSoftPulse {
+  0%, 100% { opacity: 0.55; transform: scale(0.85); }
+  50%      { opacity: 1;    transform: scale(1); }
+}
+.mic-live { animation: micSoftPulse 1.3s ease-in-out infinite; }
+
+/* --- Participant card hover (box-shadow/transform only; inline border untouched) --- */
+.participant-card {
+  transition: var(--transition-smooth);
+}
+.participant-card:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.4);
+}
+
+/* --- Toolbar realism: active press + disabled states --- */
+.zoom-btn:active {
+  transform: scale(0.93);
+}
+.zoom-btn.active {
+  background-color: rgba(59, 130, 246, 0.12);
+  color: var(--accent-primary);
+}
+.zoom-btn.is-disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.zoom-btn.is-disabled:hover {
+  background-color: transparent;
+  color: var(--color-text-secondary);
+}
+
+/* Smooth, professional state transitions across the meeting UI */
+.zoom-controls-bar .zoom-btn {
+  transition: background-color 0.2s ease, color 0.2s ease, transform 0.12s ease;
+}
+
+
+/* ============================================================
+   Sales Classroom Launcher (landing) — centered hero layout
+   ============================================================ */
+.launcher-wrap {
+  position: relative;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 48px 0;
+  overflow: hidden;
+  background-color: hsl(222, 47%, 6%);
+}
+
+/* Ambient glow removed — solid dark-blue background */
+.launcher-glow {
+  display: none;
+}
+
+/* Pill badge */
+.launcher-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 16px;
+  border-radius: 999px;
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--accent-primary);
+  background: rgba(59, 130, 246, 0.1);
+  border: 1px solid rgba(59, 130, 246, 0.28);
+  box-shadow: 0 0 20px rgba(59, 130, 246, 0.08);
+}
+
+/* Lesson card hover lift */
+.launcher-card {
+  transition: var(--transition-smooth);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+.launcher-card:hover {
+  border-color: rgba(255, 255, 255, 0.14);
+  transform: translateY(-2px);
+  box-shadow: 0 18px 44px rgba(0, 0, 0, 0.5);
+}
+
+/* Start Meeting button hover (no glow) */
+.launcher-start-btn:hover:not(:disabled) {
+  transform: translateY(-1px);
+  filter: brightness(1.08);
+}
+.launcher-start-btn:active:not(:disabled) {
+  transform: translateY(0) scale(0.98);
+}
+
+/* Feedback Screen Styles */
+.feedback-overlay {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  min-height: 100vh;
+  width: 100%;
+  background-color: var(--bg-main);
+  padding: 40px 20px;
+  overflow-y: auto;
+}
+
+.feedback-card {
+  width: 100%;
+  max-width: 620px;
+  padding: 40px;
+  border-radius: 16px;
+  background: var(--bg-glass);
+  backdrop-filter: blur(16px);
+  border: 1px solid var(--border-glass);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+  transition: var(--transition-smooth);
+}
+
+.feedback-heading {
+  font-family: var(--font-heading);
+  font-size: 2.2rem;
+  font-weight: 700;
+  margin-bottom: 10px;
+  background: linear-gradient(135deg, #ffffff 0%, #c7d2fe 60%, #94a3b8 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.feedback-subheading {
+  font-family: var(--font-body);
+  font-size: 0.95rem;
+  color: var(--color-text-secondary);
+}
+
+.feedback-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.feedback-label {
+  font-family: var(--font-heading);
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+
+.stars-container {
+  display: flex;
+  gap: 12px;
+  margin-top: 4px;
+}
+
+.star-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  outline: none;
+  transition: transform 0.2s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+}
+
+.star-btn:hover {
+  transform: scale(1.25);
+}
+
+.star-btn:active {
+  transform: scale(0.95);
+}
+
+.feedback-textarea {
+  width: 100%;
+  min-height: 96px;
+  padding: 14px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(0, 0, 0, 0.25);
+  color: #fff;
+  font-family: var(--font-body);
+  font-size: 0.9rem;
+  resize: vertical;
+  transition: var(--transition-smooth);
+}
+
+.feedback-textarea:focus {
+  border-color: var(--accent-primary);
+  background: rgba(0, 0, 0, 0.35);
+  outline: none;
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.15);
+}
+
+.char-counter {
+  font-size: 0.75rem;
+  color: var(--color-text-muted);
+  align-self: flex-end;
+  margin-top: -2px;
+}
+
+.question-group {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 4px;
+}
+
+.question-option {
+  flex: 1;
+  min-width: 80px;
+  padding: 10px 16px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  background: rgba(255, 255, 255, 0.02);
+  color: var(--color-text-secondary);
+  font-family: var(--font-body);
+  font-size: 0.85rem;
+  font-weight: 500;
+  cursor: pointer;
+  text-align: center;
+  transition: var(--transition-smooth);
+  user-select: none;
+}
+
+.question-option:hover {
+  background: rgba(255, 255, 255, 0.06);
+  border-color: rgba(255, 255, 255, 0.15);
+  color: #fff;
+}
+
+.question-option.selected {
+  background: rgba(59, 130, 246, 0.15);
+  border-color: var(--accent-primary);
+  color: #fff;
+  box-shadow: 0 0 14px rgba(59, 130, 246, 0.25);
+  font-weight: 600;
+}
+
+.feedback-actions {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 16px;
+  margin-top: 12px;
+}
+
+.btn-submit {
+  flex: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  background: linear-gradient(135deg, var(--accent-primary) 0%, hsl(217, 91%, 50%) 100%);
+  border: none;
+  color: #fff;
+  padding: 12px 28px;
+  border-radius: 10px;
+  font-size: 0.9rem;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: 0 6px 18px rgba(59, 130, 246, 0.35);
+  transition: var(--transition-smooth);
+}
+
+.btn-submit:hover:not(:disabled) {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 24px rgba(59, 130, 246, 0.45);
+}
+
+.btn-submit:active:not(:disabled) {
+  transform: translateY(0);
+}
+
+.btn-submit:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.btn-skip {
+  padding: 12px 24px;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--color-text-secondary);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  font-size: 0.9rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: var(--transition-smooth);
+}
+
+.btn-skip:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.05);
+  color: #fff;
+  border-color: rgba(255, 255, 255, 0.25);
+}
+
+.btn-skip:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.toast-notification {
+  position: fixed;
+  top: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+  border: 1px solid rgba(16, 185, 129, 0.2);
+  padding: 14px 28px;
+  border-radius: 10px;
+  color: #fff;
+  font-weight: 600;
+  font-size: 0.95rem;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  box-shadow: 0 10px 30px rgba(16, 185, 129, 0.4);
+  z-index: 1000;
+  animation: slideDown 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+@keyframes slideDown {
+  from {
+    transform: translate(-50%, -24px);
+    opacity: 0;
+  }
+  to {
+    transform: translate(-50%, 0);
+    opacity: 1;
+  }
+}
+
+@media (max-width: 640px) {
+  .feedback-card {
+    padding: 24px 20px;
+  }
+  .feedback-heading {
+    font-size: 1.8rem;
+  }
+  .question-option {
+    padding: 8px 12px;
+    font-size: 0.8rem;
+  }
+}
+
+@keyframes waveformBar {
+  0%, 100% { height: 30%; }
+  50% { height: 100%; }
+}

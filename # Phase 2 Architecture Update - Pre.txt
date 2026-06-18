@@ -1,0 +1,264 @@
+# Phase 2 Architecture Update - Pre-Generated AI Content
+
+## Critical Design Change
+
+The system must NOT call Gemini every time a training session starts.
+
+The Maruti Suzuki Victoris PPT is a fixed training module.
+
+Once the PPT has been processed, the generated narration and quiz content should be stored permanently and reused in future sessions.
+
+This reduces:
+
+* Gemini API costs
+* Gemini quota usage
+* Session startup delays
+* Risk of API failures during live training
+
+---
+
+# Desired Architecture
+
+## One-Time Content Generation
+
+Flow:
+
+PPT
+↓
+Extract Slide Text
+↓
+Gemini Generates Narration
+↓
+Gemini Generates Quiz
+↓
+Store Everything In MongoDB
+
+After this process completes:
+
+No further Gemini calls should be required for normal classroom sessions.
+
+---
+
+# Database Design
+
+## Lesson Collection
+
+{
+title,
+pptName,
+totalSlides
+}
+
+---
+
+## Slide Collection
+
+{
+lessonId,
+slideNumber,
+imageUrl,
+extractedText,
+narrationText,
+narrationAudioUrl,
+quizId
+}
+
+---
+
+## Quiz Collection
+
+{
+slideId,
+question,
+options,
+correctAnswer,
+explanation
+}
+
+---
+
+# PPT Import Process
+
+When the system first loads the training PPT:
+
+1. Convert PPT slides into images.
+2. Extract text from each slide.
+3. Generate narration for each slide.
+4. Generate quiz for each slide.
+5. Generate quiz introduction audio.
+6. Store all generated assets.
+
+This process should happen once.
+
+---
+
+# Session Runtime Flow
+
+When a trainee starts a meeting:
+
+DO NOT CALL GEMINI.
+
+Instead:
+
+Load existing lesson
+↓
+Load stored slide image
+↓
+Load stored narration
+↓
+Play stored narration audio
+↓
+Play stored quiz introduction audio
+↓
+Display stored quiz
+↓
+Continue to next slide
+
+The classroom should operate entirely from stored content.
+
+---
+
+# Gemini Usage Rules
+
+Gemini should only be used during:
+
+1. Initial PPT processing
+2. Explicit content regeneration
+
+Gemini should NOT be used during:
+
+* Session startup
+* Slide transitions
+* Quiz display
+* Live classroom playback
+
+---
+
+# Content Regeneration Feature
+
+Provide an Admin function:
+
+Regenerate AI Content
+
+When triggered:
+
+Slide Text
+↓
+Gemini
+↓
+New Narration
+↓
+New Quiz
+↓
+Update Database
+
+This should be optional.
+
+Normal users should never trigger regeneration.
+
+---
+
+# Narration Requirements
+
+For every slide:
+
+Gemini generates:
+
+* Professional trainer narration
+* Sales-focused explanation
+* Customer-facing context
+* Explanation of technical terms
+
+Length:
+
+45–90 seconds
+
+Do not generate one-line narrations.
+
+Do not simply read slide text.
+
+The narration should sound like a Maruti Suzuki trainer conducting a real classroom session.
+
+---
+
+# Quiz Requirements
+
+Generate:
+
+1 MCQ per slide
+
+Question source:
+
+Current slide only
+
+Difficulty:
+
+Easy to Moderate
+
+Purpose:
+
+Knowledge retention
+
+Store permanently.
+
+Reuse during all future sessions.
+
+---
+
+# Audio Generation
+
+Generate narration audio once.
+
+Store:
+
+{
+slideId,
+narrationAudioUrl
+}
+
+Generate quiz transition audio once.
+
+Store:
+
+{
+slideId,
+quizIntroAudioUrl
+}
+
+Reuse in every session.
+
+Do not regenerate audio during live playback.
+
+---
+
+# Failure Handling
+
+If Gemini fails during PPT processing:
+
+Retry 3 times.
+
+Use exponential backoff.
+
+If all retries fail:
+
+Mark slide as:
+
+AI_GENERATION_PENDING
+
+Allow regeneration later.
+
+Do not crash the application.
+
+---
+
+# Performance Goal
+
+Once the PPT has been imported and processed:
+
+Starting a classroom session should require:
+
+0 Gemini API calls.
+
+The entire session should run using pre-generated content stored in MongoDB.
+
+This architecture should be the default implementation.
