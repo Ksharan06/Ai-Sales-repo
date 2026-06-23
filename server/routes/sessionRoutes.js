@@ -15,6 +15,100 @@ const Feedback = require('../models/Feedback');
 const { generateLessonContent, generateAnswerForQuestion } = require('../services/geminiService');
 const { generateAudioFile } = require('../services/ttsService');
 
+const Admin = require('../models/Admin');
+const { verifyPassword } = require('../services/passwordService');
+const liveSessionStore = require('../liveSessionStore');
+
+/**
+ * POST /api/admin/login
+ * Validates admin name + password against the hashed credential in the DB.
+ * Only an admin can start a session.
+ */
+router.post('/admin/login', async (req, res) => {
+  try {
+    const { name, password } = req.body;
+    if (!name || !password) {
+      return res.status(400).json({ error: 'Name and password are required' });
+    }
+
+    const admin = await Admin.findOne({ name: name.trim() });
+    if (!admin) {
+      return res.status(401).json({ error: 'Invalid name or password' });
+    }
+
+    const ok = await verifyPassword(password, admin.passwordHash);
+    if (!ok) {
+      return res.status(401).json({ error: 'Invalid name or password' });
+    }
+
+    res.json({ success: true, name: admin.name });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * GET /api/session/state
+ * Returns the single live session snapshot. Used by trainees on join/refresh to
+ * decide between the waiting room and joining mid-stream.
+ */
+router.get('/session/state', (req, res) => {
+  res.json(liveSessionStore.snapshot());
+});
+
+/**
+ * POST /api/trainee/register
+ * Alias of /api/trainees/register matching the gateway spec. Validates name +
+ * trainee ID and persists the trainee against the live session. Duplicate
+ * traineeId within the same session is rejected.
+ */
+router.post('/trainee/register', async (req, res) => {
+  try {
+    const { traineeId, name } = req.body;
+    let { sessionId } = req.body;
+
+    if (!traineeId || typeof traineeId !== 'string' || !traineeId.trim()) {
+      return res.status(400).json({ error: 'traineeId is required' });
+    }
+    if (!name || typeof name !== 'string' || !name.trim()) {
+      return res.status(400).json({ error: 'name is required' });
+    }
+
+    // Fall back to the live session when the client doesn't supply one explicitly.
+    if (!sessionId) {
+      const live = liveSessionStore.get();
+      sessionId = live && live.isLive ? live.sessionId : null;
+    }
+    if (!sessionId) {
+      return res.status(409).json({ error: 'No live session is active' });
+    }
+
+    const Trainee = require('../models/Trainee');
+    const existing = await Trainee.findOne({ sessionId, traineeId: traineeId.trim() });
+    if (existing) {
+      // Same person reconnecting with the same name is fine; a different name is a clash.
+      if (existing.name === name.trim()) {
+        return res.json(existing);
+      }
+      return res.status(409).json({ error: 'This Trainee ID is already in use for this session' });
+    }
+
+    const trainee = await new Trainee({
+      traineeId: traineeId.trim(),
+      name: name.trim(),
+      sessionId: sessionId.trim()
+    }).save();
+
+    res.json(trainee);
+  } catch (error) {
+    // Duplicate key from the unique compound index
+    if (error.code === 11000) {
+      return res.status(409).json({ error: 'This Trainee ID is already in use for this session' });
+    }
+    res.status(500).json({ error: error.message });
+  }
+});
+
 /**
  * GET all lessons
  */
@@ -172,12 +266,14 @@ router.post('/sessions', async (req, res) => {
       fs.mkdirSync(qnaDir, { recursive: true });
     }
     const outroDestPath = path.join(qnaDir, `outro-${sessionId}.mp3`);
-    try {
-      await generateAudioFile(outroText, outroDestPath);
-      console.log(`Pre-cached Q&A outro audio at ${outroDestPath}`);
-    } catch (ttsErr) {
-      console.error(`Failed to pre-cache outro audio:`, ttsErr.message);
-    }
+    // Run pre-caching asynchronously in the background so it doesn't block session creation
+    generateAudioFile(outroText, outroDestPath)
+      .then(() => {
+        console.log(`Pre-cached Q&A outro audio at ${outroDestPath}`);
+      })
+      .catch((ttsErr) => {
+        console.error(`Failed to pre-cache outro audio:`, ttsErr.message);
+      });
 
     res.json(session);
   } catch (error) {

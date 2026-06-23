@@ -10,7 +10,10 @@ import {
   X, Check
 } from 'lucide-react';
 
-function ZoomClassroom({ sessionId, traineeId, traineeName, onLeave }) {
+function ZoomClassroom({ sessionId, role = 'admin', resume = false, traineeId, traineeName, onLeave }) {
+  // Admin is the authoritative driver of the session; trainees are passive mirrors.
+  const isAdmin = role === 'admin';
+  const adminResumedRef = useRef(false);
   const [session, setSession] = useState(null);
   const [slide, setSlide] = useState(null);
 
@@ -28,26 +31,21 @@ function ZoomClassroom({ sessionId, traineeId, traineeName, onLeave }) {
   const [score, setScore] = useState(0);
   const [totalQuizzes, setTotalQuizzes] = useState(0);
   const [showSidebar, setShowSidebar] = useState(false);
+  const [showParticipants, setShowParticipants] = useState(false);
+  const [traineesList, setTraineesList] = useState([]);
 
   // Zoom hardware controls
   const [micOn, setMicOn] = useState(false);
   const [cameraOn, setCameraOn] = useState(true);
-
-  // Camera device selection (lets the trainee pick an external webcam vs the built-in cam)
-  const [cameras, setCameras] = useState([]);
-  const [selectedCameraId, setSelectedCameraId] = useState(() => {
-    try { return localStorage.getItem('preferredCameraId') || ''; } catch { return ''; }
-  });
-  const selectedCameraIdRef = useRef('');
-  useEffect(() => { selectedCameraIdRef.current = selectedCameraId; }, [selectedCameraId]);
 
   // Meeting atmosphere (display-only) — elapsed session duration
   const [elapsedTime, setElapsedTime] = useState(0);
 
   // Meeting introduction flow:
   // 'welcome' -> 'sharing' -> 'training'
-  // (Starts on the welcome screen immediately; audio begins 1.5s after join.)
-  const [meetingPhase, setMeetingPhase] = useState('welcome');
+  // Admin sees the full intro on a fresh start. On admin refresh (resume) it skips
+  // the intro and rejoins at the live slide. Trainees mirror via live-sync.
+  const [meetingPhase, setMeetingPhase] = useState(() => (role === 'admin' && !resume ? 'welcome' : 'training'));
 
   // Trainee Question Interruption States
   const [isPaused, setIsPaused] = useState(false);
@@ -73,10 +71,6 @@ function ZoomClassroom({ sessionId, traineeId, traineeName, onLeave }) {
   const localVideoRef = useRef(null);
   const attentionVideoRef = useRef(null);
   const webcamStreamRef = useRef(null);
-  // Holds the in-flight getUserMedia promise so React 18 StrictMode's double effect
-  // invocation can never open the same camera twice (the duplicate stream returns a
-  // black/no-frame track on most webcams, which is what blacked out the trainee tile).
-  const webcamAcquiringRef = useRef(null);
   const timerIntervalRef = useRef(null);
   const narrationTimeoutRef = useRef(null);
   const narrationTokenRef = useRef(0);
@@ -90,16 +84,6 @@ function ZoomClassroom({ sessionId, traineeId, traineeName, onLeave }) {
 
   // Q&A System Refs
   const qaAudioRef = useRef(null);
-
-  // Socket listener handler refs (to prevent stale closures)
-  const sessionStateHandlerRef = useRef(null);
-  const nextSlideHandlerRef = useRef(null);
-  const qaStartedHandlerRef = useRef(null);
-  const qaIntroReadyHandlerRef = useRef(null);
-  const qaAnswerReadyHandlerRef = useRef(null);
-  const qaResumeHandlerRef = useRef(null);
-  const questionRejectedHandlerRef = useRef(null);
-  const sessionEndedHandlerRef = useRef(null);
 
   const showQuizRef = useRef(false);
   useEffect(() => {
@@ -127,11 +111,6 @@ function ZoomClassroom({ sessionId, traineeId, traineeName, onLeave }) {
   const savedAudioTimeRef = useRef(0);
   const savedAudioPartRef = useRef('');
   const isQaAudioPlayingRef = useRef(false);
-  // True from the moment the Gemini answer arrives for the active question until
-  // it actually starts playing. Keeps the resume guard up across the gap between
-  // the intro finishing and the (slower) answer beginning, so the lesson can never
-  // resume mid-sequence while we are still waiting to play the answer.
-  const qaAnswerPendingRef = useRef(false);
   const resumeDeferredRef = useRef(false);
 
   // Monitor trainee attention silently in the background
@@ -151,54 +130,318 @@ function ZoomClassroom({ sessionId, traineeId, traineeName, onLeave }) {
   useEffect(() => {
     socketRef.current = io();
 
-    socketRef.current.emit('join-session', { userId, sessionId });
-
-    socketRef.current.on('session-state', async (data) => {
-      if (sessionStateHandlerRef.current) {
-        await sessionStateHandlerRef.current(data);
+    // (Re)join on every connect so a network drop + reconnect re-syncs cleanly.
+    socketRef.current.on('connect', () => {
+      if (isAdmin) {
+        socketRef.current.emit('join-session', { userId, sessionId });
+        // Admin starts (or resumes — idempotent on the server) the live session.
+        socketRef.current.emit('session-start', { sessionId });
+      } else {
+        // Trainees join via trainee-join only; the server replies with a full
+        // live snapshot so they can mirror the admin immediately.
+        socketRef.current.emit('trainee-join', { traineeId: userId, name: userName, sessionId });
       }
+    });
+
+    socketRef.current.on('session-state', async (state) => {
+      const cs = (state && state.currentSlide) || 1;
+      initialSlideRef.current = cs;
+      if (state && state.slideQuestionCount !== undefined) {
+        setSlideQuestionCount(state.slideQuestionCount);
+      }
+      // Admin RESUME (refresh): jump straight to the live slide — skip the intro so
+      // we don't reset the shared live position back to the beginning.
+      if (isAdmin && resume && !adminResumedRef.current && socketRef.current) {
+        adminResumedRef.current = true;
+        setMeetingPhase('training');
+        socketRef.current.emit('sync-slide', { sessionId, slideNumber: cs });
+      }
+      // Fresh admin: the intro flow requests the slide itself (unchanged).
+      // Trainees do not use session-state — they sync via the live-sync event.
+    });
+
+    // Trainee-only: admin's phase transition (narration -> quiz). Drives the
+    // trainee UI instead of the trainee's own local audio-ended event.
+    socketRef.current.on('phase-update', ({ phase, quizStartedAt, serverNow }) => {
+      if (isAdmin) return;
+      if (phase === 'quiz') {
+        forceStopNarration();
+        const elapsed = (quizStartedAt && serverNow) ? (serverNow - quizStartedAt) / 1000 : 0;
+        const remaining = Math.max(1, Math.ceil(10 - elapsed));
+        startQuizCountdown(remaining);
+      }
+    });
+
+    // Trainee-only: the single live-position sync. Fired by the server on join /
+    // refresh / reconnect (trainee-join reply) AND every time the admin begins a
+    // new audio segment (intro, slide narration, quiz-intro). Always mirrors the
+    // admin's exact current position from the correct offset.
+    socketRef.current.on('live-sync', (payload) => {
+      if (isAdmin) return;
+      syncToLiveSession(payload);
+    });
+
+    // Trainee-only: mirror each Q&A audio segment (announcement -> answer ->
+    // resume-cue) the admin is playing, in sync from the correct offset.
+    socketRef.current.on('qa-audio-segment', (data) => {
+      if (isAdmin) return;
+      playQaSegment(data.segment, data.audioUrl, data.audioStartedAt, data.serverNow);
     });
 
     socketRef.current.on('next-slide', (slideData) => {
-      if (nextSlideHandlerRef.current) {
-        nextSlideHandlerRef.current(slideData);
+      // Reset quiz states for the new slide
+      setShowQuiz(false);
+      setSelectedOption(null);
+      selectedOptionRef.current = null;
+      setQuizResult(null);
+      setTimer(10);
+      setIsSubmitted(false);
+      isSubmittedRef.current = false;
+      pendingAutoAdvanceRef.current = false;
+      setSlideQuestionCount(0);
+      setActiveQA(null);
+      clearInterval(timerIntervalRef.current);
+      clearTimeout(narrationTimeoutRef.current);
+
+      // Reset and stop HTML audio player narration if active
+      if (audioRef.current) {
+        audioRef.current.pause();
+        audioRef.current.src = '';
       }
+      isAudioFilePlayingRef.current = false;
+      savedAudioSrcRef.current = '';
+      savedAudioTimeRef.current = 0;
+
+      // Reset trainee Q&A interruption states for the new slide
+      changeIsPaused(false);
+      setHandRaised(false);
+      setQuestionText('');
+      setIsAskingQuestion(false);
+      speechPartRef.current = 'narration';
+      narrationIsRunningRef.current = false;
+
+      setSlide(slideData);
+
+      if (isAdmin) {
+        // Admin: unchanged Phase 1 behaviour — play narration from the start.
+        triggerAudioSequence(slideData);
+        return;
+      }
+
+      // ---- Trainee mirror ----
+      // Mid-join during a quiz: skip narration, open the quiz with remaining time.
+      if (slideData.currentPhase === 'quiz') {
+        const elapsed = (slideData.quizStartedAt && slideData.serverNow)
+          ? (slideData.serverNow - slideData.quizStartedAt) / 1000 : 0;
+        const remaining = Math.max(1, Math.ceil(10 - elapsed));
+        setIsTeacherSpeaking(false);
+        startQuizCountdown(remaining);
+        return;
+      }
+
+      // Mid-join during a Q&A interrupt: show paused state, play answer audio from
+      // offset if it's already available (best effort); qa-resume will sync everyone.
+      if (slideData.qaInterrupt) {
+        changeIsPaused(true);
+        setShowSidebar(true);
+        const qa = slideData.qaInterrupt;
+        if (qa.audioUrl && qaAudioRef.current) {
+          const offset = (qa.audioStartedAt && slideData.serverNow)
+            ? Math.max(0, (slideData.serverNow - qa.audioStartedAt) / 1000) : 0;
+          isQaAudioPlayingRef.current = true;
+          qaAudioRef.current.src = qa.audioUrl;
+          qaAudioRef.current.onloadedmetadata = () => {
+            try { qaAudioRef.current.currentTime = offset; } catch { /* best-effort seek */ }
+          };
+          qaAudioRef.current.play().catch(() => {});
+        }
+        return;
+      }
+
+      // Normal mirror: play narration locally from the admin's current offset.
+      const narrationOffset = (slideData.narrationAudioStartedAt && slideData.serverNow)
+        ? Math.max(0, (slideData.serverNow - slideData.narrationAudioStartedAt) / 1000) : 0;
+      triggerAudioSequence(slideData, narrationOffset);
     });
 
+    // Q&A Sync Listeners
     socketRef.current.on('qa-started', (data) => {
-      if (qaStartedHandlerRef.current) {
-        qaStartedHandlerRef.current(data);
+      setSlideQuestionCount(data.slideQuestionCount);
+
+      if (audioRef.current && !audioRef.current.paused && isAudioFilePlayingRef.current) {
+        savedAudioSrcRef.current = audioRef.current.src;
+        savedAudioTimeRef.current = audioRef.current.currentTime;
+        savedAudioPartRef.current = speechPartRef.current;
+        audioRef.current.pause();
       }
+      isAudioFilePlayingRef.current = false;
+      setIsTeacherSpeaking(false);
+
+      clearInterval(timerIntervalRef.current);
+      timerIntervalRef.current = null;
+      clearTimeout(narrationTimeoutRef.current);
+      clearTimeout(introTimeoutRef.current);
+
+      isQaAudioPlayingRef.current = false;
+      resumeDeferredRef.current = false;
+
+      changeIsPaused(true);
+
+      setActiveQA({
+        questionId: data.questionId,
+        userName: data.userName,
+        questionText: data.questionText,
+        status: 'AI is thinking...',
+        introAudioUrl: null,
+        answerAudioUrl: null,
+        outroAudioUrl: null,
+        introFinished: false
+      });
+
+      setShowSidebar(true);
+      setChatHistory(prev => {
+        if (prev.some(m => m.questionId === data.questionId)) return prev;
+        const sender = data.userName === userName ? 'You' : data.userName;
+        return [
+          ...prev,
+          {
+            sender,
+            text: data.questionText,
+            questionId: data.questionId,
+            isQuestion: true
+          }
+        ];
+      });
     });
 
     socketRef.current.on('qa-intro-ready', (data) => {
-      if (qaIntroReadyHandlerRef.current) {
-        qaIntroReadyHandlerRef.current(data);
+      setActiveQA(prev => {
+        if (!prev || prev.questionId !== data.questionId) return prev;
+        return { ...prev, introAudioUrl: data.introAudioUrl };
+      });
+
+      // Only the authoritative admin plays/sequences the Q&A chain; trainees mirror
+      // each segment via the qa-audio-segment broadcast (see playQaSegment).
+      if (isAdmin && qaAudioRef.current) {
+        isQaAudioPlayingRef.current = true;
+        qaAudioRef.current.src = data.introAudioUrl;
+        // Announce this segment so every trainee plays it in sync from offset.
+        if (socketRef.current) {
+          socketRef.current.emit('qa-audio-segment', {
+            segment: 'announcement',
+            audioUrl: data.introAudioUrl,
+            questionId: data.questionId,
+            slideNumber: slideRef.current ? slideRef.current.slideNumber : null
+          });
+        }
+
+        qaAudioRef.current.onended = () => {
+          const current = activeQARef.current;
+          if (current && current.questionId === data.questionId) {
+            current.introFinished = true;
+            setActiveQA(prev => ({ ...prev, introFinished: true }));
+            if (current.answerAudioUrl) {
+              playAnswerAudio(current.answerAudioUrl, current.outroAudioUrl);
+            } else {
+              isQaAudioPlayingRef.current = false;
+              if (resumeDeferredRef.current) {
+                resumeDeferredRef.current = false;
+                executeQaResume();
+              }
+            }
+          }
+        };
+
+        qaAudioRef.current.onerror = () => {
+          const current = activeQARef.current;
+          if (current && current.questionId === data.questionId) {
+            current.introFinished = true;
+            setActiveQA(prev => ({ ...prev, introFinished: true }));
+            if (current.answerAudioUrl) {
+              playAnswerAudio(current.answerAudioUrl, current.outroAudioUrl);
+            } else {
+              isQaAudioPlayingRef.current = false;
+              if (resumeDeferredRef.current) {
+                resumeDeferredRef.current = false;
+                executeQaResume();
+              }
+            }
+          }
+        };
+
+        qaAudioRef.current.play().catch(() => {
+          const current = activeQARef.current;
+          if (current && current.questionId === data.questionId) {
+            current.introFinished = true;
+            setActiveQA(prev => ({ ...prev, introFinished: true }));
+            if (current.answerAudioUrl) {
+              playAnswerAudio(current.answerAudioUrl, current.outroAudioUrl);
+            } else {
+              isQaAudioPlayingRef.current = false;
+              if (resumeDeferredRef.current) {
+                resumeDeferredRef.current = false;
+                executeQaResume();
+              }
+            }
+          }
+        });
       }
     });
 
     socketRef.current.on('qa-answer-ready', (data) => {
-      if (qaAnswerReadyHandlerRef.current) {
-        qaAnswerReadyHandlerRef.current(data);
-      }
+      setActiveQA(prev => {
+        if (!prev || prev.questionId !== data.questionId) return prev;
+        
+        if (prev.introFinished) {
+          setTimeout(() => {
+            playAnswerAudio(data.answerAudioUrl, data.outroAudioUrl);
+          }, 0);
+        }
+        
+        return {
+          ...prev,
+          answerAudioUrl: data.answerAudioUrl,
+          outroAudioUrl: data.outroAudioUrl,
+          answerText: data.answerText
+        };
+      });
+
+      setChatHistory(prev => {
+        if (prev.some(m => m.text === data.answerText)) return prev;
+        return [
+          ...prev,
+          { sender: 'AI Instructor', text: data.answerText, questionId: data.questionId }
+        ];
+      });
     });
 
     socketRef.current.on('qa-resume', () => {
-      if (qaResumeHandlerRef.current) {
-        qaResumeHandlerRef.current();
+      if (isQaAudioPlayingRef.current) {
+        resumeDeferredRef.current = true;
+      } else {
+        executeQaResume();
       }
     });
 
-    socketRef.current.on('question-rejected', (data) => {
-      if (questionRejectedHandlerRef.current) {
-        questionRejectedHandlerRef.current(data);
-      }
+    socketRef.current.on('question-rejected', ({ reason }) => {
+      alert(reason);
     });
 
     socketRef.current.on('session-ended', () => {
-      if (sessionEndedHandlerRef.current) {
-        sessionEndedHandlerRef.current();
-      }
+      alert("Training session completed!");
+      onLeave(lessonIdRef.current);
+    });
+
+    socketRef.current.on('user-joined', () => {
+      axios.get(`/api/trainees/${sessionId}`)
+        .then(res => setTraineesList(res.data || []))
+        .catch(err => console.error("Error fetching trainees on user-joined:", err.message));
+    });
+
+    socketRef.current.on('user-left', () => {
+      axios.get(`/api/trainees/${sessionId}`)
+        .then(res => setTraineesList(res.data || []))
+        .catch(err => console.error("Error fetching trainees on user-left:", err.message));
     });
 
     // Fetch session details on mount
@@ -208,6 +451,13 @@ function ZoomClassroom({ sessionId, traineeId, traineeName, onLeave }) {
         lessonIdRef.current = res.data?.lessonId?._id || res.data?.lessonId;
       })
       .catch(err => console.error("Error fetching session:", err.message));
+
+    // Fetch initial trainees list on mount
+    axios.get(`/api/trainees/${sessionId}`)
+      .then(res => {
+        setTraineesList(res.data || []);
+      })
+      .catch(err => console.error("Error fetching trainees on mount:", err.message));
 
     return () => {
       if (socketRef.current) {
@@ -219,12 +469,16 @@ function ZoomClassroom({ sessionId, traineeId, traineeName, onLeave }) {
     };
   }, [sessionId]);
 
-  const executeQaResume = () => {
-    // The Q&A sequence is fully finished — clear all Q&A audio guards.
-    isQaAudioPlayingRef.current = false;
-    qaAnswerPendingRef.current = false;
-    resumeDeferredRef.current = false;
+  // Fetch trainees whenever the participants modal opens to ensure up-to-date data
+  useEffect(() => {
+    if (showParticipants && sessionId) {
+      axios.get(`/api/trainees/${sessionId}`)
+        .then(res => setTraineesList(res.data || []))
+        .catch(err => console.error("Error fetching trainees on modal open:", err.message));
+    }
+  }, [showParticipants, sessionId]);
 
+  const executeQaResume = () => {
     setActiveQA(null);
     changeIsPaused(false);
     setHandRaised(false);
@@ -273,29 +527,29 @@ function ZoomClassroom({ sessionId, traineeId, traineeName, onLeave }) {
             audioRef.current.onended = () => {
               isAudioFilePlayingRef.current = false;
               setIsTeacherSpeaking(false);
-              startQuizCountdown();
+              if (isAdmin) startQuizCountdown();
             };
             audioRef.current.onerror = () => {
               isAudioFilePlayingRef.current = false;
               setIsTeacherSpeaking(false);
-              startQuizCountdown();
+              if (isAdmin) startQuizCountdown();
             };
             audioRef.current.play().catch(() => {
               isAudioFilePlayingRef.current = false;
               setIsTeacherSpeaking(false);
-              startQuizCountdown();
+              if (isAdmin) startQuizCountdown();
             });
           } else {
             isAudioFilePlayingRef.current = false;
             setIsTeacherSpeaking(false);
-            startQuizCountdown();
+            if (isAdmin) startQuizCountdown();
           }
         };
       } else if (savedPart === 'intro') {
         audioRef.current.onended = () => {
           isAudioFilePlayingRef.current = false;
           setIsTeacherSpeaking(false);
-          startQuizCountdown();
+          if (isAdmin) startQuizCountdown();
         };
       } else if (savedPart === 'welcome') {
         audioRef.current.onended = () => {
@@ -309,7 +563,7 @@ function ZoomClassroom({ sessionId, traineeId, traineeName, onLeave }) {
         setIsTeacherSpeaking(false);
         if (savedPart === 'welcome') {
           setMeetingPhase('sharing');
-        } else {
+        } else if (isAdmin) {
           startQuizCountdown();
         }
       };
@@ -320,7 +574,7 @@ function ZoomClassroom({ sessionId, traineeId, traineeName, onLeave }) {
         setIsTeacherSpeaking(false);
         if (savedPart === 'welcome') {
           setMeetingPhase('sharing');
-        } else {
+        } else if (isAdmin) {
           startQuizCountdown();
         }
       });
@@ -331,16 +585,71 @@ function ZoomClassroom({ sessionId, traineeId, traineeName, onLeave }) {
     }
   };
 
+  // Trainee-only single shared routine: play one Q&A audio segment in sync with
+  // the admin. Used for fresh segment events AND mid-Q&A join / reconnect (via
+  // syncToLiveSession). Mirrors the live-narration offset math.
+  const playQaSegment = (segment, audioUrl, audioStartedAt, serverNow) => {
+    const offset = (audioStartedAt && serverNow)
+      ? Math.max(0, (serverNow - audioStartedAt) / 1000) : 0;
+
+    // Force-stop whatever is playing (narration / a previous Q&A segment) — clean.
+    forceStopNarration();
+    changeIsPaused(true);
+    setShowSidebar(true);
+
+    if (!audioUrl || !qaAudioRef.current) return;
+
+    if (!qaAudioRef.current.paused) {
+      qaAudioRef.current.pause();
+    }
+    qaAudioRef.current.onended = null;
+    isQaAudioPlayingRef.current = true;
+    qaAudioRef.current.src = audioUrl;
+    qaAudioRef.current.onloadedmetadata = () => {
+      if (offset > 0) {
+        try {
+          const dur = qaAudioRef.current.duration;
+          if (isFinite(dur) && dur > 0) {
+            qaAudioRef.current.currentTime = Math.min(offset, Math.max(0, dur - 0.1));
+          }
+        } catch { /* best-effort seek */ }
+      }
+    };
+    const handleSegmentEnd = () => {
+      isQaAudioPlayingRef.current = false;
+      // When the resume cue finishes, resume the paused phase. The server's
+      // qa-resume (driven by the admin) may have already arrived and deferred.
+      if (segment === 'resume-cue' && resumeDeferredRef.current) {
+        resumeDeferredRef.current = false;
+        executeQaResume();
+      }
+    };
+    qaAudioRef.current.onended = handleSegmentEnd;
+    qaAudioRef.current.onerror = handleSegmentEnd;
+    qaAudioRef.current.play().catch(() => { handleSegmentEnd(); });
+  };
+
   const playAnswerAudio = (answerUrl, outroUrl) => {
     setActiveQA(prev => {
       if (!prev) return null;
       return { ...prev, status: 'Answering...' };
     });
 
+    // Admin authoritative — trainees mirror via qa-audio-segment.
+    if (!isAdmin) return;
+
     if (qaAudioRef.current) {
       isQaAudioPlayingRef.current = true;
-      qaAnswerPendingRef.current = false;
       qaAudioRef.current.src = answerUrl;
+      // Announce the answer segment so trainees play it in sync from offset.
+      if (socketRef.current) {
+        socketRef.current.emit('qa-audio-segment', {
+          segment: 'answer',
+          audioUrl: answerUrl,
+          questionId: activeQARef.current ? activeQARef.current.questionId : null,
+          slideNumber: slideRef.current ? slideRef.current.slideNumber : null
+        });
+      }
       qaAudioRef.current.onended = () => {
         playOutroAudio(outroUrl);
       };
@@ -354,15 +663,31 @@ function ZoomClassroom({ sessionId, traineeId, traineeName, onLeave }) {
   };
 
   const playOutroAudio = (outroUrl) => {
+    // Admin authoritative — trainees mirror via qa-audio-segment.
+    if (!isAdmin) return;
+
     if (qaAudioRef.current) {
       isQaAudioPlayingRef.current = true;
       qaAudioRef.current.src = outroUrl;
+      // Announce the resume-cue segment so trainees play it in sync from offset.
+      if (socketRef.current) {
+        socketRef.current.emit('qa-audio-segment', {
+          segment: 'resume-cue',
+          audioUrl: outroUrl,
+          questionId: activeQARef.current ? activeQARef.current.questionId : null,
+          slideNumber: slideRef.current ? slideRef.current.slideNumber : null
+        });
+      }
       qaAudioRef.current.onended = () => {
         isQaAudioPlayingRef.current = false;
-        socketRef.current.emit('qa-playback-complete', {
-          sessionId,
-          questionId: activeQARef.current ? activeQARef.current.questionId : ''
-        });
+        // Only the authoritative admin signals completion, so the server resumes
+        // and advances the Q&A queue exactly once for the whole room.
+        if (isAdmin) {
+          socketRef.current.emit('qa-playback-complete', {
+            sessionId,
+            questionId: activeQARef.current ? activeQARef.current.questionId : ''
+          });
+        }
         if (resumeDeferredRef.current) {
           resumeDeferredRef.current = false;
           executeQaResume();
@@ -370,10 +695,14 @@ function ZoomClassroom({ sessionId, traineeId, traineeName, onLeave }) {
       };
       qaAudioRef.current.onerror = () => {
         isQaAudioPlayingRef.current = false;
-        socketRef.current.emit('qa-playback-complete', {
-          sessionId,
-          questionId: activeQARef.current ? activeQARef.current.questionId : ''
-        });
+        // Only the authoritative admin signals completion, so the server resumes
+        // and advances the Q&A queue exactly once for the whole room.
+        if (isAdmin) {
+          socketRef.current.emit('qa-playback-complete', {
+            sessionId,
+            questionId: activeQARef.current ? activeQARef.current.questionId : ''
+          });
+        }
         if (resumeDeferredRef.current) {
           resumeDeferredRef.current = false;
           executeQaResume();
@@ -381,10 +710,14 @@ function ZoomClassroom({ sessionId, traineeId, traineeName, onLeave }) {
       };
       qaAudioRef.current.play().catch(() => {
         isQaAudioPlayingRef.current = false;
-        socketRef.current.emit('qa-playback-complete', {
-          sessionId,
-          questionId: activeQARef.current ? activeQARef.current.questionId : ''
-        });
+        // Only the authoritative admin signals completion, so the server resumes
+        // and advances the Q&A queue exactly once for the whole room.
+        if (isAdmin) {
+          socketRef.current.emit('qa-playback-complete', {
+            sessionId,
+            questionId: activeQARef.current ? activeQARef.current.questionId : ''
+          });
+        }
         if (resumeDeferredRef.current) {
           resumeDeferredRef.current = false;
           executeQaResume();
@@ -471,6 +804,10 @@ function ZoomClassroom({ sessionId, traineeId, traineeName, onLeave }) {
       if (audioUrl && audioRef.current) {
         isAudioFilePlayingRef.current = true;
         audioRef.current.src = audioUrl;
+        // Report the intro as the live position so trainees mirror it at offset.
+        if (isAdmin && socketRef.current) {
+          socketRef.current.emit('admin-audio-start', { phase: 'intro', slideNumber: 1, audioUrl });
+        }
         audioRef.current.onended = () => {
           isAudioFilePlayingRef.current = false;
           finishWelcome();
@@ -491,7 +828,9 @@ function ZoomClassroom({ sessionId, traineeId, traineeName, onLeave }) {
   };
 
   // Stage 1/2 : welcome screen shows immediately; audio starts exactly 2s after join
+  // (Admin only — trainees skip the intro and mirror the admin's current state.)
   useEffect(() => {
+    if (!isAdmin) return;
     if (meetingPhase !== 'welcome') return;
     const startAudio = setTimeout(() => playWelcomeNarration(session), 1500);
     return () => {
@@ -501,15 +840,20 @@ function ZoomClassroom({ sessionId, traineeId, traineeName, onLeave }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [meetingPhase]);
 
-  // Stage 3 : brief screen-share transition (~1.5s), then training begins
+  // Stage 3 : brief screen-share transition (~1.5s), then training begins (admin only)
   useEffect(() => {
+    if (!isAdmin) return;
     if (meetingPhase !== 'sharing') return;
     const toTraining = setTimeout(() => setMeetingPhase('training'), 1500);
     return () => clearTimeout(toTraining);
   }, [meetingPhase]);
 
-  // Stage 4 : training begins — request the first slide; existing flow takes over
+  // Stage 4 : training begins — request the first slide; existing flow takes over.
+  // Admin only. On resume, the session-state handler already issued sync-slide for
+  // the live slide, so we skip here to avoid snapping back to slide 1.
   useEffect(() => {
+    if (!isAdmin) return;
+    if (resume) return;
     if (meetingPhase !== 'training') return;
     if (socketRef.current) {
       socketRef.current.emit('sync-slide', { sessionId, slideNumber: initialSlideRef.current });
@@ -517,125 +861,38 @@ function ZoomClassroom({ sessionId, traineeId, traineeName, onLeave }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [meetingPhase]);
 
-  // Bind an active webcam stream to both the visible trainee video and the hidden
-  // attention-tracking video (idempotent — only touches a node when it isn't already
-  // showing this exact stream).
-  const bindStreamToVideos = (stream) => {
-    if (!stream) return;
-    if (localVideoRef.current && localVideoRef.current.srcObject !== stream) {
-      localVideoRef.current.srcObject = stream;
-      localVideoRef.current.play().catch(err => console.warn("Failed to play local video:", err));
-    }
-    if (attentionVideoRef.current && attentionVideoRef.current.srcObject !== stream) {
-      attentionVideoRef.current.srcObject = stream;
-      attentionVideoRef.current.play().catch(err => console.warn("Failed to play attention video:", err));
-    }
-  };
-
   // Start Trainee webcam capture
   const startWebcam = async () => {
     try {
       // Reuse existing active stream if present to avoid hardware restart toggling
       if (webcamStreamRef.current && webcamStreamRef.current.active) {
-        bindStreamToVideos(webcamStreamRef.current);
+        if (localVideoRef.current && localVideoRef.current.srcObject !== webcamStreamRef.current) {
+          localVideoRef.current.srcObject = webcamStreamRef.current;
+          localVideoRef.current.play().catch(err => console.warn("Failed to play local video:", err));
+        }
+        if (attentionVideoRef.current && attentionVideoRef.current.srcObject !== webcamStreamRef.current) {
+          attentionVideoRef.current.srcObject = webcamStreamRef.current;
+          attentionVideoRef.current.play().catch(err => console.warn("Failed to play attention video:", err));
+        }
         return;
       }
 
-      // Honor the trainee's chosen camera (e.g. external webcam). Don't pin a
-      // resolution on a specific device — some USB webcams reject 320x240 — let the
-      // browser pick a supported one (the tile uses objectFit: cover anyway). Only the
-      // default-device path keeps the original 320x240 hint.
-      const preferredId = selectedCameraIdRef.current;
-      const videoConstraints = preferredId
-        ? { deviceId: { exact: preferredId } }
-        : { width: 320, height: 240 };
-
-      // Only ever open the camera once. If an acquisition is already in flight (e.g.
-      // StrictMode's second effect run, or a showSidebar re-run), await that same
-      // promise instead of opening the device a second time.
-      if (!webcamAcquiringRef.current) {
-        webcamAcquiringRef.current = acquireCamera(videoConstraints);
-      }
-
-      const stream = await webcamAcquiringRef.current;
-      webcamAcquiringRef.current = null;
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+        video: { width: 320, height: 240 }, 
+        audio: false 
+      });
       webcamStreamRef.current = stream;
-      bindStreamToVideos(stream);
-
-      // Now that permission is granted, device labels are available — list the
-      // cameras for the picker and remember which one is actually in use.
-      refreshCameraList();
-      const activeId = stream.getVideoTracks()[0]?.getSettings?.().deviceId;
-      if (activeId && activeId !== selectedCameraIdRef.current) {
-        selectedCameraIdRef.current = activeId;
-        setSelectedCameraId(activeId);
+      if (localVideoRef.current) {
+        localVideoRef.current.srcObject = stream;
+        localVideoRef.current.play().catch(err => console.warn("Failed to play local video:", err));
+      }
+      if (attentionVideoRef.current) {
+        attentionVideoRef.current.srcObject = stream;
+        attentionVideoRef.current.play().catch(err => console.warn("Failed to play attention video:", err));
       }
     } catch (err) {
-      webcamAcquiringRef.current = null;
-      // A saved camera is genuinely gone (unplugged). Drop the preference and retry
-      // once with the system default instead of going black.
-      if (selectedCameraIdRef.current &&
-          (err.name === 'OverconstrainedError' || err.name === 'NotFoundError')) {
-        selectedCameraIdRef.current = '';
-        setSelectedCameraId('');
-        try { localStorage.removeItem('preferredCameraId'); } catch { /* ignore */ }
-        return startWebcam();
-      }
-      console.warn("Webcam access failed:", err.name, err.message);
+      console.warn("Webcam access denied or unavailable:", err.message);
       setCameraOn(false);
-    }
-  };
-
-  // Open a camera, riding out the transient Windows "Could not start video source"
-  // (NotReadableError / AbortError) that fires when a device is opened immediately
-  // after another was released (e.g. when switching from the built-in cam to a USB
-  // webcam). Retries the SAME device after a short delay before giving up.
-  const acquireCamera = async (videoConstraints) => {
-    try {
-      return await navigator.mediaDevices.getUserMedia({ video: videoConstraints, audio: false });
-    } catch (err) {
-      if (err.name === 'NotReadableError' || err.name === 'AbortError') {
-        await new Promise(resolve => setTimeout(resolve, 500));
-        return await navigator.mediaDevices.getUserMedia({ video: videoConstraints, audio: false });
-      }
-      throw err;
-    }
-  };
-
-  // List available video input devices for the camera picker.
-  const refreshCameraList = async () => {
-    try {
-      const devices = await navigator.mediaDevices.enumerateDevices();
-      setCameras(devices.filter(d => d.kind === 'videoinput'));
-    } catch (err) {
-      console.warn("Could not enumerate cameras:", err.message);
-    }
-  };
-
-  // Switch to a different camera: tear down the current stream and re-acquire with the
-  // chosen device, then persist the choice for next time.
-  const switchCamera = async (deviceId) => {
-    if (!deviceId || deviceId === selectedCameraIdRef.current) return;
-    selectedCameraIdRef.current = deviceId;
-    setSelectedCameraId(deviceId);
-    try { localStorage.setItem('preferredCameraId', deviceId); } catch { /* ignore */ }
-
-    // Release the current device and clear the old frame before opening the new one.
-    if (webcamStreamRef.current) {
-      webcamStreamRef.current.getTracks().forEach(track => track.stop());
-      webcamStreamRef.current = null;
-    }
-    webcamAcquiringRef.current = null;
-    if (localVideoRef.current) localVideoRef.current.srcObject = null;
-    if (attentionVideoRef.current) attentionVideoRef.current.srcObject = null;
-
-    if (cameraOn) {
-      // Camera already on → acquire the new device now (the effect won't re-fire).
-      await startWebcam();
-    } else {
-      // Camera was off (e.g. a prior failed attempt) → turning it on lets the
-      // camera effect acquire the newly chosen device.
-      setCameraOn(true);
     }
   };
 
@@ -650,21 +907,6 @@ function ZoomClassroom({ sessionId, traineeId, traineeName, onLeave }) {
     }
     if (attentionVideoRef.current) {
       attentionVideoRef.current.srcObject = null;
-    }
-  };
-
-  // Callback ref for the visible trainee <video>: attach the live webcam stream the
-  // instant the node mounts/remounts. This removes the race where getUserMedia resolves
-  // before the element exists (or the element remounts after the stream is ready), which
-  // left the trainee tile black because nothing re-bound the stream. Keeps localVideoRef
-  // populated so startWebcam/stopWebcam/the safety-net effect keep working unchanged.
-  const attachLocalVideo = (node) => {
-    localVideoRef.current = node;
-    if (node && webcamStreamRef.current && webcamStreamRef.current.active) {
-      if (node.srcObject !== webcamStreamRef.current) {
-        node.srcObject = webcamStreamRef.current;
-      }
-      node.play().catch(err => console.warn("Failed to play local video on mount:", err));
     }
   };
 
@@ -713,8 +955,10 @@ function ZoomClassroom({ sessionId, traineeId, traineeName, onLeave }) {
       .replace(/\b([A-Za-z])X[iI]\b/g, (m, p1) => `${p1.toUpperCase()} X I`);
   };
 
-  // Audio Playback or Speech Synthesis Fallback
-  const triggerAudioSequence = async (slideData) => {
+  // Audio Playback or Speech Synthesis Fallback.
+  // startOffsetSec > 0 is used by trainees joining mid-narration so they hear the
+  // same point as the admin.
+  const triggerAudioSequence = async (slideData, startOffsetSec = 0) => {
     setIsTeacherSpeaking(true);
     narrationTokenRef.current += 1;
     const myToken = narrationTokenRef.current;
@@ -728,11 +972,20 @@ function ZoomClassroom({ sessionId, traineeId, traineeName, onLeave }) {
     const wordCount = `${narrationText} ${quizIntroText}`.trim().split(/\s+/).filter(Boolean).length;
     const estimatedMs = Math.max(6000, Math.round((wordCount / 2.3) * 1000));
 
-    const revealQuiz = () => {
+    // Narration (and quiz-intro) finished. Admin begins the quiz now (and tells
+    // trainees via phase-change inside startQuizCountdown). Trainees do NOT start
+    // the quiz from their own audio-end — they wait for the admin's phase-update.
+    const completeNarration = () => {
       if (isStale()) return;
+      isAudioFilePlayingRef.current = false;
       setIsTeacherSpeaking(false);
       narrationIsRunningRef.current = false;
-      startQuizCountdown();
+      if (isAdmin) startQuizCountdown();
+    };
+
+    const revealQuiz = () => {
+      if (isStale()) return;
+      completeNarration();
     };
 
     const scheduleFallback = () => {
@@ -747,7 +1000,15 @@ function ZoomClassroom({ sessionId, traineeId, traineeName, onLeave }) {
         speechPartRef.current = 'narration';
 
         audioRef.current.src = slideData.narrationAudioUrl;
-        
+        // Report slide narration as the live position (trainees mirror via live-sync).
+        if (isAdmin && socketRef.current) {
+          socketRef.current.emit('admin-audio-start', {
+            phase: 'narration',
+            slideNumber: slideData.slideNumber,
+            audioUrl: slideData.narrationAudioUrl
+          });
+        }
+
         audioRef.current.onended = () => {
           if (isStale()) return;
 
@@ -755,13 +1016,18 @@ function ZoomClassroom({ sessionId, traineeId, traineeName, onLeave }) {
           if (slideData.quizIntroAudioUrl) {
             speechPartRef.current = 'intro';
             audioRef.current.src = slideData.quizIntroAudioUrl;
-            
+            // Report the quiz-intro as the live position too (trainees mirror it).
+            if (isAdmin && socketRef.current) {
+              socketRef.current.emit('admin-audio-start', {
+                phase: 'narration',
+                slideNumber: slideData.slideNumber,
+                audioUrl: slideData.quizIntroAudioUrl
+              });
+            }
+
             audioRef.current.onended = () => {
               if (isStale()) return;
-              isAudioFilePlayingRef.current = false;
-              setIsTeacherSpeaking(false);
-              narrationIsRunningRef.current = false;
-              startQuizCountdown();
+              completeNarration();
             };
 
             audioRef.current.onerror = () => {
@@ -777,10 +1043,7 @@ function ZoomClassroom({ sessionId, traineeId, traineeName, onLeave }) {
               revealQuiz();
             });
           } else {
-            isAudioFilePlayingRef.current = false;
-            setIsTeacherSpeaking(false);
-            narrationIsRunningRef.current = false;
-            startQuizCountdown();
+            completeNarration();
           }
         };
 
@@ -790,6 +1053,18 @@ function ZoomClassroom({ sessionId, traineeId, traineeName, onLeave }) {
           isAudioFilePlayingRef.current = false;
           scheduleFallback();
         };
+
+        // Trainee mid-join: seek narration to the admin's current offset.
+        if (startOffsetSec > 0) {
+          audioRef.current.onloadedmetadata = () => {
+            try {
+              const dur = audioRef.current.duration;
+              if (isFinite(dur) && dur > 0) {
+                audioRef.current.currentTime = Math.min(startOffsetSec, Math.max(0, dur - 0.3));
+              }
+            } catch { /* best-effort seek */ }
+          };
+        }
 
         await audioRef.current.play();
       } catch (err) {
@@ -920,8 +1195,6 @@ function ZoomClassroom({ sessionId, traineeId, traineeName, onLeave }) {
 
   // Submit trainee question via Socket.IO
   const submitQuestion = async () => {
-    // Q&A is locked until the first training slide is shared and visible.
-    if (!slide) return;
     if (!questionText.trim() || isAskingQuestion || slideQuestionCount >= 4 || activeQA !== null || isPaused) return;
 
     const currentQuestion = questionText;
@@ -938,8 +1211,6 @@ function ZoomClassroom({ sessionId, traineeId, traineeName, onLeave }) {
 
   // Voice input for Q&A — manual start/stop, no auto-stop on silence
   const handleMicStart = async (target) => {
-    // Q&A is locked until the first training slide is shared and visible.
-    if (!slide) return;
     setMicTarget(target); // 'sidebar' or 'modal' — track which input is recording
     try {
       // Quick mic availability check before starting recognition —
@@ -976,10 +1247,37 @@ function ZoomClassroom({ sessionId, traineeId, traineeName, onLeave }) {
     setMicTarget(null);
   };
 
-  // Start Quiz Countdown Timer
-  const startQuizCountdown = () => {
+  // Force-stop the local narration audio immediately (no fade) — used by trainees
+  // when the admin's phase-update arrives while their narration is still playing.
+  const forceStopNarration = () => {
+    narrationTokenRef.current += 1; // invalidate in-flight narration callbacks
+    clearTimeout(narrationTimeoutRef.current);
+    clearTimeout(introTimeoutRef.current);
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current.onended = null;
+      audioRef.current.src = '';
+    }
+    isAudioFilePlayingRef.current = false;
+    narrationIsRunningRef.current = false;
+    setIsTeacherSpeaking(false);
+  };
+
+  // Start Quiz Countdown Timer. startSeconds < 10 is used by trainees joining a
+  // quiz already in progress so they only get the remaining time.
+  const startQuizCountdown = (startSeconds = 10) => {
+    // Admin announces the quiz phase so every trainee mirrors it at the same time.
+    if (isAdmin && socketRef.current) {
+      socketRef.current.emit('phase-change', {
+        sessionId,
+        slideNumber: slideRef.current ? slideRef.current.slideNumber : (slide ? slide.slideNumber : 1),
+        phase: 'quiz'
+      });
+    }
+
+    clearInterval(timerIntervalRef.current);
     setShowQuiz(true);
-    setTimer(10);
+    setTimer(startSeconds);
     setIsSubmitted(false);
     isSubmittedRef.current = false;
     setSelectedOption(null);
@@ -996,6 +1294,125 @@ function ZoomClassroom({ sessionId, traineeId, traineeName, onLeave }) {
         return prev - 1;
       });
     }, 1000);
+  };
+
+  // ---- Trainee mirror routines (admin position is the source of truth) -------
+
+  // Apply a slide for a trainee without triggering the admin's local audio chain.
+  // Quiz state is only reset when the slide actually changes, so re-syncs on the
+  // same slide (narration -> quiz-intro) don't wipe an open quiz.
+  const applyTraineeSlide = (slideData) => {
+    const changed = !slideRef.current || slideRef.current.slideNumber !== slideData.slideNumber;
+    setSlide(slideData);
+    setMeetingPhase('training');
+    if (changed) {
+      setShowQuiz(false);
+      setSelectedOption(null);
+      selectedOptionRef.current = null;
+      setQuizResult(null);
+      setTimer(10);
+      setIsSubmitted(false);
+      isSubmittedRef.current = false;
+      setSlideQuestionCount(0);
+      setActiveQA(null);
+    }
+  };
+
+  // Play the exact audio the admin is currently playing, from the given offset.
+  // On end, the trainee simply waits for the admin's next live-sync / phase-update.
+  const playMirrorAudio = (url, offsetSec, part) => {
+    narrationTokenRef.current += 1;
+    const myToken = narrationTokenRef.current;
+    clearTimeout(narrationTimeoutRef.current);
+    clearTimeout(introTimeoutRef.current);
+    if (!url || !audioRef.current) {
+      setIsTeacherSpeaking(false);
+      return;
+    }
+    speechPartRef.current = part || 'narration';
+    isAudioFilePlayingRef.current = true;
+    setIsTeacherSpeaking(true);
+
+    audioRef.current.src = url;
+    audioRef.current.onloadedmetadata = () => {
+      if (offsetSec > 0) {
+        try {
+          const dur = audioRef.current.duration;
+          if (isFinite(dur) && dur > 0) {
+            audioRef.current.currentTime = Math.min(offsetSec, Math.max(0, dur - 0.3));
+          }
+        } catch { /* best-effort seek */ }
+      }
+    };
+    audioRef.current.onended = () => {
+      if (myToken !== narrationTokenRef.current) return;
+      isAudioFilePlayingRef.current = false;
+      setIsTeacherSpeaking(false);
+    };
+    audioRef.current.onerror = () => {
+      if (myToken !== narrationTokenRef.current) return;
+      isAudioFilePlayingRef.current = false;
+      setIsTeacherSpeaking(false);
+    };
+    audioRef.current.play().catch(() => {
+      isAudioFilePlayingRef.current = false;
+      setIsTeacherSpeaking(false);
+    });
+  };
+
+  // THE single shared sync routine. Mirrors the admin's exact live position
+  // (slide + phase + audio offset). Used identically for fresh join, refresh,
+  // reconnect, and every ongoing admin audio segment.
+  const syncToLiveSession = (payload) => {
+    if (!payload || isAdmin) return;
+    if (!payload.isLive) return;
+
+    const offset = (payload.audioStartedAt && payload.serverNow)
+      ? Math.max(0, (payload.serverNow - payload.audioStartedAt) / 1000) : 0;
+
+    // Quiz in progress: open the quiz with the remaining time.
+    if (payload.phase === 'quiz') {
+      forceStopNarration();
+      if (payload.slide) applyTraineeSlide(payload.slide);
+      const elapsed = (payload.quizStartedAt && payload.serverNow)
+        ? (payload.serverNow - payload.quizStartedAt) / 1000 : 0;
+      startQuizCountdown(Math.max(1, Math.ceil(10 - elapsed)));
+      return;
+    }
+
+    // Q&A interrupt active (mid-Q&A join / reconnect): land on the current segment
+    // at the right offset via the same routine fresh segment events use.
+    if (payload.phase === 'qa' && payload.qaInterrupt) {
+      if (payload.slide) applyTraineeSlide(payload.slide);
+      const qa = payload.qaInterrupt;
+      playQaSegment(qa.segment, qa.audioUrl, qa.audioStartedAt, payload.serverNow);
+      return;
+    }
+
+    // Welcome intro as a live position: show the intro screen, audio from offset.
+    if (payload.phase === 'intro') {
+      changeIsPaused(false);
+      setShowQuiz(false);
+      setSlide(null);
+      setMeetingPhase('welcome');
+      playMirrorAudio(payload.audioUrl, offset, 'welcome');
+      return;
+    }
+
+    // Slide narration (or quiz-intro): render the slide, play current audio @ offset.
+    if (payload.phase === 'narration') {
+      changeIsPaused(false);
+      if (payload.slide) applyTraineeSlide(payload.slide);
+      const part = (payload.slide && payload.audioUrl === payload.slide.narrationAudioUrl) ? 'narration' : 'intro';
+      playMirrorAudio(payload.audioUrl, offset, part);
+      return;
+    }
+
+    // idle: admin hasn't begun audio yet — show the starting screen and wait.
+    setShowQuiz(false);
+    setSlide(null);
+    setMeetingPhase('welcome');
+    setIsTeacherSpeaking(false);
   };
 
   // Handle Option Selection (without submitting yet)
@@ -1075,14 +1492,23 @@ function ZoomClassroom({ sessionId, traineeId, traineeName, onLeave }) {
       if (isPausedRef.current) {
         setShowQuiz(false);
         pendingAutoAdvanceRef.current = true;
-      } else {
+      } else if (isAdmin) {
         autoAdvanceNextSlide();
+      } else {
+        // Trainee: never drives progression — just hide the poll and wait for the
+        // admin's next-slide broadcast.
+        setShowQuiz(false);
       }
     }, 2500);
   };
 
-  // Auto-advance progression to next slide (or feedback if final slide)
+  // Auto-advance progression to next slide (or feedback if final slide).
+  // ADMIN ONLY — trainees mirror the resulting next-slide broadcast.
   const autoAdvanceNextSlide = () => {
+    if (!isAdmin) {
+      setShowQuiz(false);
+      return;
+    }
     clearInterval(timerIntervalRef.current);
     clearTimeout(narrationTimeoutRef.current);
     narrationTokenRef.current += 1;
@@ -1145,232 +1571,6 @@ function ZoomClassroom({ sessionId, traineeId, traineeName, onLeave }) {
 
     socketRef.current.emit('request-next-slide', { sessionId });
   };
-
-  // Assign socket listener handler refs on every render
-  sessionStateHandlerRef.current = async ({ currentSlide, slideQuestionCount }) => {
-    initialSlideRef.current = currentSlide || 1;
-    if (slideQuestionCount !== undefined) {
-      setSlideQuestionCount(slideQuestionCount);
-    }
-  };
-
-  nextSlideHandlerRef.current = (slideData) => {
-    // Reset quiz states for the new slide
-    setShowQuiz(false);
-    setSelectedOption(null);
-    selectedOptionRef.current = null;
-    setQuizResult(null);
-    setTimer(10);
-    setIsSubmitted(false);
-    isSubmittedRef.current = false;
-    pendingAutoAdvanceRef.current = false;
-    setSlideQuestionCount(0);
-    setActiveQA(null);
-    isQaAudioPlayingRef.current = false;
-    qaAnswerPendingRef.current = false;
-    resumeDeferredRef.current = false;
-    clearInterval(timerIntervalRef.current);
-    clearTimeout(narrationTimeoutRef.current);
-
-    // Reset and stop HTML audio player narration if active
-    if (audioRef.current) {
-      audioRef.current.pause();
-      audioRef.current.src = '';
-    }
-    isAudioFilePlayingRef.current = false;
-    savedAudioSrcRef.current = '';
-    savedAudioTimeRef.current = 0;
-
-    // Reset trainee Q&A interruption states for the new slide
-    changeIsPaused(false);
-    setHandRaised(false);
-    setQuestionText('');
-    setIsAskingQuestion(false);
-    speechPartRef.current = 'narration';
-    narrationIsRunningRef.current = false;
-
-    setSlide(slideData);
-    
-    // Trigger Audio Playback Sequence
-    triggerAudioSequence(slideData);
-  };
-
-  qaStartedHandlerRef.current = (data) => {
-    setSlideQuestionCount(data.slideQuestionCount);
-
-    if (audioRef.current && !audioRef.current.paused && isAudioFilePlayingRef.current) {
-      savedAudioSrcRef.current = audioRef.current.src;
-      savedAudioTimeRef.current = audioRef.current.currentTime;
-      savedAudioPartRef.current = speechPartRef.current;
-      audioRef.current.pause();
-    }
-    isAudioFilePlayingRef.current = false;
-    setIsTeacherSpeaking(false);
-
-    clearInterval(timerIntervalRef.current);
-    timerIntervalRef.current = null;
-    clearTimeout(narrationTimeoutRef.current);
-    clearTimeout(introTimeoutRef.current);
-
-    isQaAudioPlayingRef.current = false;
-    qaAnswerPendingRef.current = false;
-    resumeDeferredRef.current = false;
-
-    changeIsPaused(true);
-
-    setActiveQA({
-      questionId: data.questionId,
-      userName: data.userName,
-      questionText: data.questionText,
-      status: 'AI is thinking...',
-      introAudioUrl: null,
-      answerAudioUrl: null,
-      outroAudioUrl: null,
-      introFinished: false
-    });
-
-    setShowSidebar(true);
-    setChatHistory(prev => {
-      if (prev.some(m => m.questionId === data.questionId)) return prev;
-      const sender = data.userName === userName ? 'You' : data.userName;
-      return [
-        ...prev,
-        {
-          sender,
-          text: data.questionText,
-          questionId: data.questionId,
-          isQuestion: true
-        }
-      ];
-    });
-  };
-
-  qaIntroReadyHandlerRef.current = (data) => {
-    setActiveQA(prev => {
-      if (!prev || prev.questionId !== data.questionId) return prev;
-      return { ...prev, introAudioUrl: data.introAudioUrl };
-    });
-
-    if (qaAudioRef.current) {
-      isQaAudioPlayingRef.current = true;
-      qaAudioRef.current.src = data.introAudioUrl;
-      
-      qaAudioRef.current.onended = () => {
-        const current = activeQARef.current;
-        if (current && current.questionId === data.questionId) {
-          current.introFinished = true;
-          setActiveQA(prev => ({ ...prev, introFinished: true }));
-          if (current.answerAudioUrl) {
-            playAnswerAudio(current.answerAudioUrl, current.outroAudioUrl);
-          } else {
-            isQaAudioPlayingRef.current = false;
-            if (resumeDeferredRef.current) {
-              resumeDeferredRef.current = false;
-              executeQaResume();
-            }
-          }
-        }
-      };
-
-      qaAudioRef.current.onerror = () => {
-        const current = activeQARef.current;
-        if (current && current.questionId === data.questionId) {
-          current.introFinished = true;
-          setActiveQA(prev => ({ ...prev, introFinished: true }));
-          if (current.answerAudioUrl) {
-            playAnswerAudio(current.answerAudioUrl, current.outroAudioUrl);
-          } else {
-            isQaAudioPlayingRef.current = false;
-            if (resumeDeferredRef.current) {
-              resumeDeferredRef.current = false;
-              executeQaResume();
-            }
-          }
-        }
-      };
-
-      qaAudioRef.current.play().catch(() => {
-        const current = activeQARef.current;
-        if (current && current.questionId === data.questionId) {
-          current.introFinished = true;
-          setActiveQA(prev => ({ ...prev, introFinished: true }));
-          if (current.answerAudioUrl) {
-            playAnswerAudio(current.answerAudioUrl, current.outroAudioUrl);
-          } else {
-            isQaAudioPlayingRef.current = false;
-            if (resumeDeferredRef.current) {
-              resumeDeferredRef.current = false;
-              executeQaResume();
-            }
-          }
-        }
-      });
-    }
-  };
-
-  qaAnswerReadyHandlerRef.current = (data) => {
-    const current = activeQARef.current;
-    if (current && current.questionId === data.questionId) {
-      // Record the answer synchronously on the live ref so the intro->answer handoff
-      // never depends on a React state commit landing between two socket callbacks
-      // (which could otherwise drop the answer entirely). Mark the answer as pending
-      // so the resume guard stays up until the answer actually starts playing.
-      current.answerAudioUrl = data.answerAudioUrl;
-      current.outroAudioUrl = data.outroAudioUrl;
-      qaAnswerPendingRef.current = true;
-
-      // If the intro already finished, its onended handler has already run without an
-      // answer to play, so start the answer here. Otherwise the intro's onended handler
-      // will start it once the intro finishes. Exactly one of the two paths plays it.
-      if (current.introFinished) {
-        setTimeout(() => {
-          playAnswerAudio(data.answerAudioUrl, data.outroAudioUrl);
-        }, 0);
-      }
-    }
-
-    setActiveQA(prev => {
-      if (!prev || prev.questionId !== data.questionId) return prev;
-      return {
-        ...prev,
-        answerAudioUrl: data.answerAudioUrl,
-        outroAudioUrl: data.outroAudioUrl,
-        answerText: data.answerText
-      };
-    });
-
-    setChatHistory(prev => {
-      if (prev.some(m => m.text === data.answerText)) return prev;
-      return [
-        ...prev,
-        { sender: 'AI Instructor', text: data.answerText, questionId: data.questionId }
-      ];
-    });
-  };
-
-  qaResumeHandlerRef.current = () => {
-    // Hold the resume while ANY part of the Q&A sequence is still outstanding:
-    // intro/answer/outro currently playing (isQaAudioPlayingRef), OR the answer has
-    // arrived and is waiting to start (qaAnswerPendingRef). The deferred resume is
-    // executed at the genuine terminal point (outro end / no-answer error branch).
-    if (isQaAudioPlayingRef.current || qaAnswerPendingRef.current) {
-      resumeDeferredRef.current = true;
-    } else {
-      executeQaResume();
-    }
-  };
-
-  questionRejectedHandlerRef.current = ({ reason }) => {
-    alert(reason);
-  };
-
-  sessionEndedHandlerRef.current = () => {
-    alert("Training session completed!");
-    onLeave(lessonIdRef.current);
-  };
-
-  // Q&A (voice + chat) stays locked until the first training slide is shared/visible.
-  const qaLocked = !slide;
 
   return (
     <div className="zoom-container animate-fade">
@@ -1666,6 +1866,83 @@ function ZoomClassroom({ sessionId, traineeId, traineeName, onLeave }) {
                     </button>
                   </div>
                 )}
+
+                {/* Participants Panel/Modal */}
+                {showParticipants && (
+                  <div 
+                    className="glass-panel"
+                    style={{
+                      position: 'absolute',
+                      top: '50%',
+                      left: '50%',
+                      transform: 'translate(-50%, -50%)',
+                      width: '400px',
+                      maxHeight: '80%',
+                      zIndex: 100,
+                      display: 'flex',
+                      flexDirection: 'column',
+                      padding: '24px',
+                      boxShadow: '0 25px 60px rgba(0, 0, 0, 0.85)',
+                      border: '1px solid rgba(255, 255, 255, 0.15)',
+                      backgroundColor: 'rgba(15, 23, 42, 0.95)',
+                      borderRadius: '16px',
+                      color: '#fff',
+                      fontFamily: 'var(--font-body)'
+                    }}
+                  >
+                    {/* Header */}
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', paddingBottom: '12px', borderBottom: '1px solid rgba(255,255,255,0.08)', marginBottom: '16px' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                        <Users style={{ width: '18px', height: '18px', color: 'var(--accent-primary)' }} />
+                        <span style={{ fontSize: '1.1rem', fontWeight: '700' }}>Participants</span>
+                      </div>
+                      <button 
+                        onClick={() => setShowParticipants(false)}
+                        style={{ background: 'none', border: 'none', color: 'var(--color-text-muted)', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '4px', borderRadius: '50%', transition: 'background-color 0.2s' }}
+                        onMouseEnter={(e) => e.target.style.backgroundColor = 'rgba(255,255,255,0.08)'}
+                        onMouseLeave={(e) => e.target.style.backgroundColor = 'transparent'}
+                      >
+                        <X style={{ width: '18px', height: '18px' }} />
+                      </button>
+                    </div>
+
+                    {/* Content */}
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                      <div style={{ fontSize: '0.9rem', fontWeight: '600', color: 'var(--color-text-secondary)', marginBottom: '4px', textAlign: 'left' }}>
+                        Trainees Present:
+                      </div>
+                      
+                      {/* Trainees List */}
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', overflowY: 'auto', maxHeight: '250px', paddingRight: '4px' }}>
+                        {traineesList.length === 0 ? (
+                          <div style={{ fontSize: '0.8rem', color: 'var(--color-text-muted)', fontStyle: 'italic', padding: '12px 0', textAlign: 'left' }}>
+                            No trainees present.
+                          </div>
+                        ) : (
+                          traineesList.map((trainee) => (
+                            <div 
+                              key={trainee._id || trainee.traineeId}
+                              style={{ 
+                                display: 'flex', 
+                                alignItems: 'center', 
+                                gap: '10px', 
+                                padding: '8px 12px', 
+                                backgroundColor: 'rgba(255,255,255,0.02)', 
+                                border: '1px solid rgba(255,255,255,0.04)',
+                                borderRadius: '8px' 
+                              }}
+                            >
+                              <div style={{ width: '8px', height: '8px', borderRadius: '50%', backgroundColor: '#22c55e' }} />
+                              <span style={{ fontSize: '0.85rem', fontWeight: '500', color: '#fff', textAlign: 'left' }}>
+                                {trainee.name}
+                              </span>
+                            </div>
+                          ))
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                )}
               </div>
             </div>
           ) : (
@@ -1766,14 +2043,8 @@ function ZoomClassroom({ sessionId, traineeId, traineeName, onLeave }) {
                     padding: '20px'
                   }}>
                     <HelpCircle style={{ width: '36px', height: '36px', color: 'var(--accent-primary)', opacity: 0.6, marginBottom: '10px' }} />
-                    {qaLocked ? (
-                      <p style={{ fontSize: '0.8rem' }}>Questions can be asked after the training content is shared.</p>
-                    ) : (
-                      <>
-                        <p style={{ fontSize: '0.8rem' }}>Have a question about this slide?</p>
-                        <p style={{ fontSize: '0.75rem', marginTop: '4px' }}>Raise your hand to pause the session and ask the instructor.</p>
-                      </>
-                    )}
+                    <p style={{ fontSize: '0.8rem' }}>Have a question about this slide?</p>
+                    <p style={{ fontSize: '0.75rem', marginTop: '4px' }}>Raise your hand to pause the session and ask the instructor.</p>
                   </div>
                 ) : (
                   chatHistory.map((msg, index) => {
@@ -1896,8 +2167,8 @@ function ZoomClassroom({ sessionId, traineeId, traineeName, onLeave }) {
                         value={questionText}
                         onChange={(e) => setQuestionText(e.target.value)}
                         onKeyDown={(e) => { if (e.key === 'Enter') submitQuestion(); }}
-                        disabled={qaLocked || isAskingQuestion || slideQuestionCount >= 4 || activeQA !== null || isPaused}
-                        placeholder={qaLocked ? "Questions can be asked after the training content is shared." : slideQuestionCount >= 4 ? "Question limit reached for this slide" : "Ask a question"}
+                        disabled={isAskingQuestion || slideQuestionCount >= 4 || activeQA !== null || isPaused}
+                        placeholder={slideQuestionCount >= 4 ? "Question limit reached for this slide" : "Ask a question"}
                         style={{
                           flex: 1,
                           padding: '10px 40px 10px 12px',
@@ -1912,7 +2183,7 @@ function ZoomClassroom({ sessionId, traineeId, traineeName, onLeave }) {
                       />
                       <button
                         onClick={() => handleMicStart('sidebar')}
-                        disabled={qaLocked || isAskingQuestion || slideQuestionCount >= 4 || activeQA !== null || isPaused}
+                        disabled={isAskingQuestion || slideQuestionCount >= 4 || activeQA !== null || isPaused}
                         title="Ask with voice"
                         style={{
                           background: 'none', border: 'none', cursor: 'pointer',
@@ -1923,11 +2194,11 @@ function ZoomClassroom({ sessionId, traineeId, traineeName, onLeave }) {
                       </button>
                       <button
                         onClick={submitQuestion}
-                        disabled={qaLocked || isAskingQuestion || !questionText.trim() || slideQuestionCount >= 4 || activeQA !== null || isPaused}
+                        disabled={isAskingQuestion || !questionText.trim() || slideQuestionCount >= 4 || activeQA !== null || isPaused}
                         style={{
                           background: 'none', border: 'none', padding: '4px',
-                          color: (!qaLocked && !isAskingQuestion && questionText.trim() && slideQuestionCount < 4 && activeQA === null && !isPaused) ? 'var(--accent-primary)' : 'var(--color-text-muted)',
-                          cursor: (!qaLocked && !isAskingQuestion && questionText.trim() && slideQuestionCount < 4 && activeQA === null && !isPaused) ? 'pointer' : 'not-allowed'
+                          color: (!isAskingQuestion && questionText.trim() && slideQuestionCount < 4 && activeQA === null && !isPaused) ? 'var(--accent-primary)' : 'var(--color-text-muted)',
+                          cursor: (!isAskingQuestion && questionText.trim() && slideQuestionCount < 4 && activeQA === null && !isPaused) ? 'pointer' : 'not-allowed'
                         }}
                       >
                         <ChevronRight style={{ width: '18px', height: '18px' }} />
@@ -1940,17 +2211,17 @@ function ZoomClassroom({ sessionId, traineeId, traineeName, onLeave }) {
                 {!isPaused ? (
                   <button
                     onClick={submitQuestion}
-                    disabled={qaLocked || !questionText.trim() || isAskingQuestion || slideQuestionCount >= 4 || activeQA !== null}
+                    disabled={!questionText.trim() || isAskingQuestion || slideQuestionCount >= 4 || activeQA !== null}
                     style={{
                       width: '100%',
                       padding: '10px',
-                      backgroundColor: (!qaLocked && questionText.trim() && slideQuestionCount < 4 && activeQA === null) ? 'rgba(59, 130, 246, 0.1)' : 'rgba(255, 255, 255, 0.02)',
-                      border: (!qaLocked && questionText.trim() && slideQuestionCount < 4 && activeQA === null) ? '1px solid var(--accent-primary)' : '1px solid rgba(255, 255, 255, 0.08)',
+                      backgroundColor: (questionText.trim() && slideQuestionCount < 4 && activeQA === null) ? 'rgba(59, 130, 246, 0.1)' : 'rgba(255, 255, 255, 0.02)',
+                      border: (questionText.trim() && slideQuestionCount < 4 && activeQA === null) ? '1px solid var(--accent-primary)' : '1px solid rgba(255, 255, 255, 0.08)',
                       borderRadius: '8px',
-                      color: (!qaLocked && questionText.trim() && slideQuestionCount < 4 && activeQA === null) ? 'var(--accent-primary)' : 'var(--color-text-muted)',
+                      color: (questionText.trim() && slideQuestionCount < 4 && activeQA === null) ? 'var(--accent-primary)' : 'var(--color-text-muted)',
                       fontWeight: '600',
                       fontSize: '0.8rem',
-                      cursor: (!qaLocked && questionText.trim() && slideQuestionCount < 4 && activeQA === null) ? 'pointer' : 'not-allowed',
+                      cursor: (questionText.trim() && slideQuestionCount < 4 && activeQA === null) ? 'pointer' : 'not-allowed',
                       display: 'flex',
                       alignItems: 'center',
                       justifyContent: 'center',
@@ -2083,34 +2354,12 @@ function ZoomClassroom({ sessionId, traineeId, traineeName, onLeave }) {
                   )}
                 </div>
 
-                {/* Top Right: Camera picker (only when more than one camera is available) */}
-                {cameras.length > 1 && (
-                  <select
-                    value={selectedCameraId}
-                    onChange={(e) => switchCamera(e.target.value)}
-                    title="Choose camera"
-                    style={{
-                      position: 'absolute', top: '12px', right: '12px', zIndex: 6,
-                      maxWidth: '60%',
-                      backgroundColor: 'rgba(0,0,0,0.6)', color: '#fff',
-                      border: '1px solid rgba(255,255,255,0.12)', borderRadius: '4px',
-                      fontSize: '0.6rem', padding: '3px 6px', cursor: 'pointer', outline: 'none'
-                    }}
-                  >
-                    {cameras.map((cam, i) => (
-                      <option key={cam.deviceId || i} value={cam.deviceId} style={{ color: '#000' }}>
-                        {cam.label || `Camera ${i + 1}`}
-                      </option>
-                    ))}
-                  </select>
-                )}
-
                 {cameraOn ? (
-                  <video
-                    ref={attachLocalVideo}
-                    autoPlay
-                    playsInline
-                    muted
+                  <video 
+                    ref={localVideoRef} 
+                    autoPlay 
+                    playsInline 
+                    muted 
                     style={{ width: '100%', height: '100%', objectFit: 'cover' }}
                   />
                 ) : (
@@ -2180,7 +2429,11 @@ function ZoomClassroom({ sessionId, traineeId, traineeName, onLeave }) {
         <div className="zoom-controls-group">
           
           {/* Participants */}
-          <button className="zoom-btn" style={{ opacity: 0.85 }}>
+          <button 
+            onClick={() => setShowParticipants(!showParticipants)} 
+            className={`zoom-btn ${showParticipants ? 'active' : ''}`} 
+            style={{ opacity: 0.85 }}
+          >
             <div style={{ position: 'relative' }}>
               <Users className="zoom-btn-icon" />
               <span style={{ position: 'absolute', top: '-4px', right: '-4px', backgroundColor: '#2563eb', color: '#fff', fontSize: '0.55rem', padding: '1px 4px', borderRadius: '6px', fontWeight: 'bold' }}>2</span>

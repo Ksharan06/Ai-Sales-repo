@@ -1,28 +1,8 @@
+const sdk = require('microsoft-cognitiveservices-speech-sdk');
 const fs = require('fs');
-const https = require('https');
-
-/**
- * Escape text for safe inclusion inside SSML/XML.
- */
-function escapeXml(str) {
-  return String(str)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&apos;');
-}
 
 /**
  * Generates an MP3 file at destPath from text using Microsoft Azure Neural TTS.
- *
- * Uses the Azure TTS REST endpoint (POST SSML over plain HTTPS) instead of the
- * Speech SDK's WebSocket transport. Some networks/antivirus/VPNs allow normal
- * HTTPS but break the persistent WebSocket the SDK uses, which surfaces as
- * "Unable to contact server. StatusCode: 1006". REST avoids that channel
- * entirely while using the same Azure resource, key, region, voice and MP3
- * output. Signature and return behavior are unchanged: resolves `false` for
- * empty text, `true` once the MP3 is written, and rejects on any failure.
  */
 async function generateAudioFile(text, destPath) {
   return new Promise((resolve, reject) => {
@@ -38,58 +18,47 @@ async function generateAudioFile(text, destPath) {
         return reject(new Error("Azure TTS credentials (AZURE_TTS_KEY or AZURE_TTS_REGION) are missing in environment variables."));
       }
 
-      const voice = process.env.AZURE_TTS_VOICE || "en-US-AndrewNeural";
-      const language = process.env.AZURE_TTS_LANGUAGE || "en-US";
+      const speechConfig = sdk.SpeechConfig.fromSubscription(key, region);
 
-      // Same audio profile the SDK used: Audio16Khz128KBitRateMonoMp3
-      const outputFormat = "audio-16khz-128kbitrate-mono-mp3";
+      // Configure output format to standard MP3
+      speechConfig.speechSynthesisOutputFormat = sdk.SpeechSynthesisOutputFormat.Audio16Khz128KBitRateMonoMp3;
 
-      const ssml =
-        `<speak version='1.0' xml:lang='${language}'>` +
-        `<voice xml:lang='${language}' name='${voice}'>` +
-        `${escapeXml(text)}` +
-        `</voice></speak>`;
+      // Set voice and language parameters
+      speechConfig.speechSynthesisVoiceName = process.env.AZURE_TTS_VOICE || "en-US-AndrewNeural";
+      speechConfig.speechSynthesisLanguage = process.env.AZURE_TTS_LANGUAGE || "en-US";
 
-      const payload = Buffer.from(ssml, 'utf8');
+      // Synthesize to memory (null audio config so it doesn't play on the server speakers)
+      const synthesizer = new sdk.SpeechSynthesizer(speechConfig, null);
 
-      const options = {
-        method: 'POST',
-        hostname: `${region}.tts.speech.microsoft.com`,
-        path: '/cognitiveservices/v1',
-        headers: {
-          'Ocp-Apim-Subscription-Key': key,
-          'Content-Type': 'application/ssml+xml',
-          'X-Microsoft-OutputFormat': outputFormat,
-          'User-Agent': 'aisales-tts',
-          'Content-Length': payload.length
-        }
-      };
+      // Setup a 4-second timeout to prevent hanging the server on network/credentials issues
+      const timer = setTimeout(() => {
+        try {
+          synthesizer.close();
+        } catch (e) {}
+        reject(new Error("Azure TTS synthesis timed out (network or invalid credentials)"));
+      }, 4000);
 
-      const req = https.request(options, (res) => {
-        const chunks = [];
-        res.on('data', (chunk) => chunks.push(chunk));
-        res.on('end', () => {
-          const body = Buffer.concat(chunks);
-          if (res.statusCode === 200) {
-            try {
-              fs.writeFileSync(destPath, body);
-              resolve(true);
-            } catch (writeErr) {
-              reject(writeErr);
-            }
+      synthesizer.speakTextAsync(
+        text,
+        (result) => {
+          clearTimeout(timer);
+          if (result.reason === sdk.ResultReason.SynthesizingAudioCompleted) {
+            const buffer = Buffer.from(result.audioData);
+            fs.writeFileSync(destPath, buffer);
+            synthesizer.close();
+            resolve(true);
           } else {
-            const details = body.toString('utf8') || `Status code: ${res.statusCode}`;
-            reject(new Error(`Azure TTS synthesis failed: HTTP ${res.statusCode} ${details}`));
+            const details = result.errorDetails || `Reason code: ${result.reason}`;
+            synthesizer.close();
+            reject(new Error(`Azure TTS synthesis failed: ${details}`));
           }
-        });
-      });
-
-      req.on('error', (err) => {
-        reject(new Error(`Azure TTS synthesis failed: ${err.message}`));
-      });
-
-      req.write(payload);
-      req.end();
+        },
+        (err) => {
+          clearTimeout(timer);
+          synthesizer.close();
+          reject(err);
+        }
+      );
     } catch (err) {
       reject(err);
     }

@@ -20,6 +20,10 @@ const { enqueueQuestion, processNext } = require('./services/questionQueue');
 const { generateAnswerForQuestion } = require('./services/geminiService');
 const { generateAudioFile } = require('./services/ttsService');
 
+// Live-session source-of-truth mirror (admin-authoritative). Used so late-joining
+// trainees can sync to the admin's current slide/phase/audio offset.
+const liveSessionStore = require('./liveSessionStore');
+
 const app = express();
 const server = http.createServer(app);
 
@@ -153,6 +157,48 @@ mongoose.connect(mongoUri)
 // In-memory slide question counter store: sessionId -> { currentSlideNumber: Number, count: Number }
 const sessionQuestionCounts = new Map();
 
+// Build the slide content payload trainees need to render a slide. Returns null
+// for non-slide positions (e.g. the welcome intro).
+async function fetchSlidePayload(lessonId, slideNumber) {
+  if (!lessonId || !slideNumber) return null;
+  const slide = await Slide.findOne({ lessonId, slideNumber }).populate('quizId');
+  if (!slide) return null;
+  return {
+    slideNumber: slide.slideNumber,
+    slideId: slide._id,
+    title: `Slide ${slide.slideNumber}`,
+    imageUrl: slide.imageUrl,
+    extractedText: slide.extractedText,
+    narrationText: slide.narrationText,
+    narrationAudioUrl: slide.narrationAudioUrl,
+    quizIntroAudioUrl: slide.quizIntroAudioUrl,
+    quiz: slide.quizId
+  };
+}
+
+// Build the single live-position snapshot used to sync a trainee to exactly what
+// the admin is doing right now (used for fresh join, refresh and reconnect alike).
+async function buildLiveSyncPayload() {
+  const live = liveSessionStore.snapshot();
+  const base = {
+    isLive: live.isLive,
+    phase: live.currentPhase,
+    slideNumber: live.currentSlide,
+    audioUrl: live.currentAudioUrl,
+    audioStartedAt: live.currentAudioStartedAt,
+    quizStartedAt: live.quizStartedAt,
+    qaInterrupt: live.qaInterrupt,
+    serverNow: live.serverNow,
+    slide: null
+  };
+  // Q&A pause and quiz/narration all sit on top of a slide; intro/idle do not.
+  if (live.qaInterrupt) base.phase = 'qa';
+  if (base.phase === 'qa' || base.phase === 'quiz' || base.phase === 'narration') {
+    base.slide = await fetchSlidePayload(live.lessonId, live.currentSlide);
+  }
+  return base;
+}
+
 // Socket.IO Classroom Sync Logic
 io.on('connection', (socket) => {
   console.log(`Socket connected: ${socket.id}`);
@@ -187,11 +233,21 @@ io.on('connection', (socket) => {
         }
         const counts = sessionQuestionCounts.get(sessionId);
 
-        // Send current session state to the newly joined user
+        // Send current session state to the newly joined user.
+        // Merge the live (admin-authoritative) snapshot so trainees joining
+        // mid-stream can mirror the exact phase + compute audio offsets.
+        const live = liveSessionStore.snapshot();
         socket.emit('session-state', {
           currentSlide: session.currentSlide,
           status: session.status,
-          slideQuestionCount: counts.count
+          slideQuestionCount: counts.count,
+          isLive: live.isLive,
+          currentPhase: live.currentPhase,
+          currentAudioUrl: live.currentAudioUrl,
+          currentAudioStartedAt: live.currentAudioStartedAt,
+          quizStartedAt: live.quizStartedAt,
+          qaInterrupt: live.qaInterrupt,
+          serverNow: live.serverNow
         });
       }
     } catch (err) {
@@ -229,7 +285,17 @@ io.on('connection', (socket) => {
             count: 0
           });
 
-          io.to(sessionId).emit('next-slide', {
+          // Stamp the live store: narration for this slide is beginning now.
+          liveSessionStore.setNarration({
+            currentSlide: slide.slideNumber,
+            audioUrl: slide.narrationAudioUrl
+          });
+          const liveNow = liveSessionStore.snapshot();
+
+          // Only the admin (the requester) renders via next-slide; trainees follow
+          // the admin's authoritative position via the live-sync broadcast that the
+          // admin emits when it actually begins playing the narration.
+          socket.emit('next-slide', {
             slideNumber: slide.slideNumber,
             slideId: slide._id,
             title: `Slide ${slide.slideNumber}`,
@@ -239,7 +305,9 @@ io.on('connection', (socket) => {
             narrationAudioUrl: slide.narrationAudioUrl,
             quizIntroAudioUrl: slide.quizIntroAudioUrl,
             quiz: slide.quizId,
-            slideQuestionCount: 0
+            slideQuestionCount: 0,
+            narrationAudioStartedAt: liveNow.currentAudioStartedAt,
+            serverNow: liveNow.serverNow
           });
         }
       } else {
@@ -247,6 +315,7 @@ io.on('connection', (socket) => {
         session.status = 'completed';
         session.endedAt = new Date();
         await session.save();
+        liveSessionStore.end();
         io.to(sessionId).emit('session-ended');
       }
     } catch (err) {
@@ -267,6 +336,10 @@ io.on('connection', (socket) => {
 
       if (slide) {
         const counts = sessionQuestionCounts.get(sessionId) || { currentSlideNumber: slide.slideNumber, count: 0 };
+        const live = liveSessionStore.snapshot();
+        // Only forward live audio timing if the live store is on this same slide
+        // (otherwise a late joiner would seek with a stale offset).
+        const sameSlide = live.isLive && live.currentSlide === slide.slideNumber;
         socket.emit('next-slide', {
           slideNumber: slide.slideNumber,
           slideId: slide._id,
@@ -277,11 +350,118 @@ io.on('connection', (socket) => {
           narrationAudioUrl: slide.narrationAudioUrl,
           quizIntroAudioUrl: slide.quizIntroAudioUrl,
           quiz: slide.quizId,
-          slideQuestionCount: counts.count
+          slideQuestionCount: counts.count,
+          // Mid-stream sync hints (null when not applicable):
+          currentPhase: sameSlide ? live.currentPhase : 'narration',
+          narrationAudioStartedAt: sameSlide && live.currentPhase === 'narration' ? live.currentAudioStartedAt : null,
+          quizStartedAt: sameSlide && live.currentPhase === 'quiz' ? live.quizStartedAt : null,
+          qaInterrupt: sameSlide ? live.qaInterrupt : null,
+          serverNow: live.serverNow
         });
       }
     } catch (err) {
       console.error('Error syncing slide:', err.message);
+    }
+  });
+
+  // ---- Role gateway / live-sync layer (admin authoritative) ----------------
+
+  // Admin clicks Start: mark the session live and wake any waiting trainees.
+  socket.on('session-start', async ({ sessionId }) => {
+    try {
+      socket.join(sessionId);
+      const existing = liveSessionStore.get();
+      // Idempotent: if the admin is just reconnecting to an already-live session
+      // (e.g. a page refresh), do NOT reset the store — preserve current slide/phase.
+      if (!(existing.isLive && existing.sessionId === sessionId)) {
+        const session = await Session.findOne({ sessionId });
+        const lessonId = session ? session.lessonId : null;
+        liveSessionStore.start({ sessionId, lessonId });
+        console.log(`Admin started live session ${sessionId}`);
+      }
+      // Track the authoritative admin socket (so admin-only relays can exclude it).
+      liveSessionStore.setAdminSocket(socket.id);
+      // Broadcast to every connected client so waiting-room trainees transition in.
+      io.emit('session-started', { sessionId });
+    } catch (err) {
+      console.error('Error handling session-start:', err.message);
+    }
+  });
+
+  // Admin reports it has begun playing an audio segment (welcome intro, slide
+  // narration, or quiz-intro). We record it as the live position and relay a
+  // single live-sync to every trainee so they mirror the exact point + offset.
+  // This is purely additive — it does not change how the admin plays anything.
+  socket.on('admin-audio-start', async ({ phase, slideNumber, audioUrl }) => {
+    try {
+      liveSessionStore.setAudio({ phase, slideNumber, audioUrl });
+      const sid = liveSessionStore.get().sessionId;
+      if (!sid) return;
+      const payload = await buildLiveSyncPayload();
+      socket.to(sid).emit('live-sync', payload);
+    } catch (err) {
+      console.error('Error handling admin-audio-start:', err.message);
+    }
+  });
+
+  // Admin reports it has begun playing one segment of the Q&A interrupt chain
+  // (announcement -> answer -> resume-cue). We stamp it as the active interrupt
+  // (so mid-Q&A joiners sync correctly) and relay it to every trainee, who play
+  // it via the same offset math as live narration. Purely additive wiring — the
+  // Phase 1 Q&A chain (order, content, timing, cap) is untouched.
+  socket.on('qa-audio-segment', ({ segment, audioUrl, slideNumber, askedByTraineeId, questionId }) => {
+    try {
+      const sid = liveSessionStore.get().sessionId;
+      if (!sid) return;
+      const audioStartedAt = Date.now();
+      liveSessionStore.setQaInterrupt({ segment, audioUrl, audioStartedAt, slideNumber, askedByTraineeId, questionId });
+      socket.to(sid).emit('qa-audio-segment', {
+        segment,
+        audioUrl,
+        audioStartedAt,
+        serverNow: Date.now(),
+        slideNumber,
+        askedByTraineeId,
+        questionId
+      });
+    } catch (err) {
+      console.error('Error handling qa-audio-segment:', err.message);
+    }
+  });
+
+  // Admin's existing auto-progression reports a phase transition (narration -> quiz).
+  // We only relay it; we never decide phases here. Q&A is NOT a phase (separate events).
+  socket.on('phase-change', ({ sessionId, slideNumber, phase }) => {
+    try {
+      if (phase === 'quiz') {
+        liveSessionStore.setQuiz({ currentSlide: slideNumber });
+      }
+      const live = liveSessionStore.snapshot();
+      socket.to(sessionId).emit('phase-update', {
+        slideNumber,
+        phase,
+        quizStartedAt: live.quizStartedAt,
+        serverNow: live.serverNow
+      });
+    } catch (err) {
+      console.error('Error handling phase-change:', err.message);
+    }
+  });
+
+  // Trainee joins (mid-stream join, refresh, or reconnect — all the same path).
+  // Reply with the single live-sync snapshot so the client mirrors the admin's
+  // exact current position (slide, phase, audio offset) immediately.
+  socket.on('trainee-join', async ({ traineeId, name, sessionId }) => {
+    try {
+      const live = liveSessionStore.get();
+      const targetSession = sessionId || live.sessionId;
+      if (targetSession) {
+        socket.join(targetSession);
+      }
+      const payload = await buildLiveSyncPayload();
+      socket.emit('live-sync', payload);
+    } catch (err) {
+      console.error('Error handling trainee-join:', err.message);
     }
   });
 
@@ -439,6 +619,7 @@ io.on('connection', (socket) => {
           await QuestionAnswer.updateOne({ questionId }, { status: 'failed' });
 
           // Broadcast resume so classroom is not frozen
+          liveSessionStore.clearQaInterrupt();
           io.to(sessionId).emit('qa-resume');
 
           // Emit error toast only to the asking trainee
@@ -471,6 +652,7 @@ io.on('connection', (socket) => {
       }
 
       // Broadcast qa-resume to the entire room
+      liveSessionStore.clearQaInterrupt();
       io.to(sessionId).emit('qa-resume');
 
       // Trigger next question processing from queue
@@ -478,6 +660,7 @@ io.on('connection', (socket) => {
     } catch (err) {
       console.error("Error in qa-playback-complete handler:", err);
       // Failsafe: resume room and next queue
+      liveSessionStore.clearQaInterrupt();
       io.to(sessionId).emit('qa-resume');
       processNext(sessionId);
     }

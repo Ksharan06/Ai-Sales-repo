@@ -1,14 +1,16 @@
 import React, { useState } from 'react';
-import axios from 'axios';
 import { Loader2, User, Hash, AlertCircle, BookOpen } from 'lucide-react';
 
-function TraineeRegistration({ sessionId, onRegister, onBack }) {
+/**
+ * Trainee registration form. Collects name + trainee ID and hands them to the
+ * parent via onRegister. The parent decides whether to join a live session or
+ * drop into the waiting room, and may throw (e.g. duplicate ID) which we surface.
+ */
+function TraineeRegistration({ onRegister, onBack }) {
   const [name, setName] = useState('');
   const [traineeId, setTraineeId] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
-
-  const truncatedSessionId = sessionId ? sessionId.substring(0, 8) : '';
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -25,19 +27,10 @@ function TraineeRegistration({ sessionId, onRegister, onBack }) {
 
     setLoading(true);
     try {
-      const response = await axios.post('/api/trainees/register', {
-        traineeId: traineeId.trim(),
-        name: name.trim(),
-        sessionId: sessionId
-      });
-      
-      onRegister({
-        traineeId: response.data.traineeId,
-        name: response.data.name
-      });
+      await onRegister({ traineeId: traineeId.trim(), name: name.trim() });
     } catch (err) {
       console.error('Registration failed:', err);
-      setError(err.response?.data?.error || 'Failed to join session. Please try again.');
+      setError(err?.message || 'Failed to join session. Please try again.');
     } finally {
       setLoading(false);
     }
@@ -56,7 +49,7 @@ function TraineeRegistration({ sessionId, onRegister, onBack }) {
           <div style={{ textAlign: 'center' }}>
             <div className="launcher-pill" style={{ marginBottom: '16px' }}>
               <BookOpen style={{ width: '14px', height: '14px' }} />
-              Session ID: {truncatedSessionId}
+              Trainee Registration
             </div>
             <h2 style={{ fontSize: '1.8rem', color: '#fff', marginBottom: '8px' }}>
               Join Training Session

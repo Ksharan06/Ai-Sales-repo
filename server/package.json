@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js",
-    "attention-report": "node scripts/attention-report.js"
+    "attention-report": "node scripts/attention-report.js",
+    "seed-admin": "node scripts/seed-admin.js"
   },
   "dependencies": {
     "@google/generative-ai": "^0.11.0",

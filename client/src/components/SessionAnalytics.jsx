@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import axios from 'axios';
 import { Loader2, Users, Award, BarChart2, CheckCircle2, XCircle, Clock, AlertCircle } from 'lucide-react';
 
-function SessionAnalytics({ sessionId, onContinue }) {
+function SessionAnalytics({ sessionId, traineeId = null, onContinue }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -59,7 +59,14 @@ function SessionAnalytics({ sessionId, onContinue }) {
     );
   }
 
-  const { trainees = [], quizzes = [], answers = [] } = data;
+  // When opened by a trainee, scope the matrix to just their own results.
+  const quizzes = data.quizzes || [];
+  const trainees = traineeId
+    ? (data.trainees || []).filter(t => t.traineeId === traineeId)
+    : (data.trainees || []);
+  const answers = traineeId
+    ? (data.answers || []).filter(a => a.traineeId === traineeId)
+    : (data.answers || []);
 
   // Calculate Metrics
   const totalTrainees = trainees.length;

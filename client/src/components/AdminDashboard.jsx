@@ -83,14 +83,10 @@ function AdminDashboard({ onStartSession }) {
     }
   };
 
-  // Handle Session Start
-  const handleStartSession = async (lessonId) => {
-    try {
-      const response = await axios.post('/api/sessions', { lessonId });
-      onStartSession(response.data.sessionId);
-    } catch (err) {
-      alert("Failed to launch classroom: " + err.message);
-    }
+  // Handle Session Start — opens the role gateway. The session itself is created
+  // later, when an admin authenticates (only an admin can start a session).
+  const handleStartSession = (lessonId) => {
+    onStartSession(lessonId);
   };
 
   return (
